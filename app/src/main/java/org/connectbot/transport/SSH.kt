@@ -76,6 +76,12 @@ import org.connectbot.sshlib.KeyFingerprint
 import org.connectbot.sshlib.KeyboardInteractiveCallback
 import org.connectbot.sshlib.PortForwarder
 import org.connectbot.sshlib.SessionExit
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeout
+import org.connectbot.paullm.SshExecResult
+import org.connectbot.sshlib.SftpClient
+import org.connectbot.sshlib.SftpResult
 import org.connectbot.sshlib.SshClient
 import org.connectbot.sshlib.SshClientConfig
 import org.connectbot.sshlib.SshCryptoPolicy
@@ -1837,6 +1843,64 @@ open class SSH : AbsTransport {
      * SSH returns "ssh", Mosh overrides to return "mosh".
      */
     open fun instanceProtocolName(): String = PROTOCOL
+
+    override fun supportsRemoteTools(): Boolean = authenticated && client != null
+
+    override suspend fun openSftpClient(): SftpResult<SftpClient> = withContext(Dispatchers.IO) {
+        val sshClient = client
+        if (sshClient == null || !authenticated) {
+            return@withContext SftpResult.ProtocolError("SSH session is not authenticated")
+        }
+        sshClient.openSftp()
+    }
+
+    override suspend fun execCommand(command: String, timeoutMs: Long): SshExecResult = withContext(Dispatchers.IO) {
+        val sshClient = client
+        if (sshClient == null || !authenticated) {
+            return@withContext SshExecResult(error = "SSH session is not authenticated")
+        }
+        try {
+            withTimeout(timeoutMs) {
+                val execSession = sshClient.openSession()
+                    ?: return@withTimeout SshExecResult(error = "Failed to open SSH exec channel")
+                try {
+                    if (!execSession.requestExec(command)) {
+                        return@withTimeout SshExecResult(error = "Server rejected exec request")
+                    }
+                    val (outStr, errStr) = coroutineScope {
+                        val outJob = async {
+                            val buf = java.io.ByteArrayOutputStream()
+                            for (chunk in execSession.stdout) {
+                                if (buf.size() < 262_144) {
+                                    buf.write(chunk, 0, minOf(chunk.size, 262_144 - buf.size()))
+                                }
+                            }
+                            buf.toString(StandardCharsets.UTF_8.name())
+                        }
+                        val errJob = async {
+                            val buf = java.io.ByteArrayOutputStream()
+                            for (chunk in execSession.stderr) {
+                                if (buf.size() < 65_536) {
+                                    buf.write(chunk, 0, minOf(chunk.size, 65_536 - buf.size()))
+                                }
+                            }
+                            buf.toString(StandardCharsets.UTF_8.name())
+                        }
+                        outJob.await() to errJob.await()
+                    }
+                    val exit = execSession.exitInfo.await()
+                    val code = (exit as? SessionExit.Status)?.code?.toInt()
+                    SshExecResult(stdout = outStr, stderr = errStr, exitCode = code)
+                } finally {
+                    execSession.close()
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            SshExecResult(error = e.message ?: e.javaClass.simpleName)
+        }
+    }
 
     companion object {
         internal fun getKeySizeFromAlgorithm(algorithm: String, keyBlob: ByteArray): Int = when {

@@ -26,7 +26,10 @@ import org.connectbot.data.entity.PortForward
 import org.connectbot.di.CoroutineDispatchers
 import org.connectbot.service.TerminalBridge
 import org.connectbot.service.TerminalManager
+import org.connectbot.paullm.SshExecResult
 import org.connectbot.sshlib.ConnectionInfo
+import org.connectbot.sshlib.SftpClient
+import org.connectbot.sshlib.SftpResult
 import java.io.IOException
 
 /**
@@ -302,4 +305,12 @@ abstract class AbsTransport {
      * SSH returns true, Mosh returns false (Mosh handles network roaming internally).
      */
     open fun resetOnConnectionChange(): Boolean = true
+
+    open fun supportsRemoteTools(): Boolean = false
+
+    open suspend fun execCommand(command: String, timeoutMs: Long = 10_000L): SshExecResult =
+        SshExecResult(error = "Remote command execution is only available on SSH connections")
+
+    open suspend fun openSftpClient(): SftpResult<SftpClient> =
+        SftpResult.ProtocolError("SFTP is only available on SSH connections")
 }

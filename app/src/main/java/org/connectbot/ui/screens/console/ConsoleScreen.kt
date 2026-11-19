@@ -58,16 +58,21 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ExitToApp
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.LinkOff
+import androidx.compose.material.icons.filled.MonitorHeart
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.SwapHoriz
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
@@ -155,6 +160,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.connectbot.R
 import org.connectbot.data.entity.Host
+import org.connectbot.paullm.PaullmComposeBar
+import org.connectbot.paullm.PaullmShell
+import org.connectbot.paullm.ServerStatsSheet
+import org.connectbot.paullm.SftpBrowserDialog
+import org.connectbot.paullm.TmuxManagerSheet
+import org.connectbot.paullm.TmuxRemoteController
+import org.connectbot.paullm.ToolkitSheet
 import org.connectbot.service.AuthBanner
 import org.connectbot.service.DisconnectReason
 import org.connectbot.service.PromptRequest
@@ -835,6 +847,11 @@ fun ConsoleScreen(
     }
     var showKeyboardSettings by rememberSaveable(currentBridgeId) { mutableStateOf(false) }
     var showConnectionInfoDialog by remember(currentBridgeId) { mutableStateOf(false) }
+    var showComposeBar by rememberSaveable(currentBridgeId) { mutableStateOf(false) }
+    var showTmuxSheet by remember(currentBridgeId) { mutableStateOf(false) }
+    var showSftpDialog by remember(currentBridgeId) { mutableStateOf(false) }
+    var showToolkitSheet by remember(currentBridgeId) { mutableStateOf(false) }
+    var showStatsSheet by remember(currentBridgeId) { mutableStateOf(false) }
     val automationState by currentBridge?.automationState?.collectAsState()
         ?: remember { mutableStateOf(org.connectbot.service.automation.AutomationState()) }
 
@@ -864,6 +881,7 @@ fun ConsoleScreen(
     // Check if any modal (menu or dialog) is currently active
     val anyModalActive = showKeyboardSettings || showMenu || showUrlScanDialog || showResizeDialog ||
         showDisconnectDialog || showSessionPickerDialog || showTextInputDialog || showConnectionInfoDialog ||
+        showTmuxSheet || showSftpDialog || showToolkitSheet || showStatsSheet ||
         isHardwareKeyPromptActive || currentAuthBanner != null
 
     fun restartTitleBarTimer() {
@@ -1336,6 +1354,28 @@ fun ConsoleScreen(
                             )
                         }
                     }
+
+                    val activeBridgeForCompose = uiState.bridges[uiState.currentBridgeIndex]
+                    if (showComposeBar) {
+                        PaullmComposeBar(
+                            hostId = activeBridgeForCompose.host.id,
+                            canSend = !disconnected && sessionOpen,
+                            onCollapse = {
+                                showComposeBar = false
+                                termFocusRequester.requestFocus()
+                            },
+                            onSend = { text, mode ->
+                                coroutineScope.launch {
+                                    PaullmShell.sendComposeText(activeBridgeForCompose, text, mode)
+                                }
+                            },
+                            onMessage = { msg ->
+                                coroutineScope.launch {
+                                    snackbarHostState.showSnackbar(msg)
+                                }
+                            },
+                        )
+                    }
                 }
             }
         }
@@ -1431,6 +1471,52 @@ fun ConsoleScreen(
             )
         }
 
+        if (showTmuxSheet && currentBridge != null) {
+            TmuxManagerSheet(
+                bridge = currentBridge,
+                onDismiss = {
+                    showTmuxSheet = false
+                    termFocusRequester.requestFocus()
+                },
+                onMessage = { msg ->
+                    coroutineScope.launch { snackbarHostState.showSnackbar(msg) }
+                },
+            )
+        }
+
+        if (showSftpDialog && currentBridge != null) {
+            SftpBrowserDialog(
+                bridge = currentBridge,
+                onDismiss = {
+                    showSftpDialog = false
+                    termFocusRequester.requestFocus()
+                },
+            )
+        }
+
+        if (showToolkitSheet && currentBridge != null) {
+            ToolkitSheet(
+                bridge = currentBridge,
+                onDismiss = {
+                    showToolkitSheet = false
+                    termFocusRequester.requestFocus()
+                },
+                onMessage = { msg ->
+                    coroutineScope.launch { snackbarHostState.showSnackbar(msg) }
+                },
+            )
+        }
+
+        if (showStatsSheet && currentBridge != null) {
+            ServerStatsSheet(
+                bridge = currentBridge,
+                onDismiss = {
+                    showStatsSheet = false
+                    termFocusRequester.requestFocus()
+                },
+            )
+        }
+
         // Overlay TopAppBar - always visible when titleBarHide is false,
         // or temporarily visible when titleBarHide is true and showTitleBar is true
         if (!titleBarHide || showTitleBar) {
@@ -1476,16 +1562,45 @@ fun ConsoleScreen(
                         }
                     }
 
-                    // Text Input button
+                    val remoteToolsReady = currentBridge?.supportsRemoteTools() == true
+
+                    // Inline Compose + Voice bar toggle
                     IconButton(
-                        onClick = { showTextInputDialog = true },
+                        onClick = { showComposeBar = !showComposeBar },
                         enabled = currentBridge != null,
                         modifier = Modifier.testTag("title_bar_text_input"),
                     ) {
                         Icon(
                             Icons.Default.Edit,
-                            contentDescription = stringResource(R.string.console_menu_text_input),
+                            contentDescription = "Compose and voice bar",
+                            tint = if (showComposeBar) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurface
+                            },
                         )
+                    }
+
+                    // tmux Session Manager
+                    if (remoteToolsReady) {
+                        IconButton(
+                            onClick = { showTmuxSheet = true },
+                        ) {
+                            Icon(
+                                Icons.Default.Terminal,
+                                contentDescription = "tmux sessions",
+                            )
+                        }
+
+                        // SFTP File Browser
+                        IconButton(
+                            onClick = { showSftpDialog = true },
+                        ) {
+                            Icon(
+                                Icons.Default.Folder,
+                                contentDescription = "SFTP files",
+                            )
+                        }
                     }
 
                     // Paste button - always visible
@@ -1556,6 +1671,38 @@ fun ConsoleScreen(
                                         selectBridgePreservingKeyboard(uiState.currentBridgeIndex + 1)
                                     },
                                     enabled = uiState.currentBridgeIndex < uiState.bridges.lastIndex,
+                                )
+                            }
+
+                            if (remoteToolsReady) {
+                                DropdownMenuItem(
+                                    text = { Text("AI Vibe Toolkit") },
+                                    onClick = {
+                                        showMenu = false
+                                        showToolkitSheet = true
+                                    },
+                                    leadingIcon = { Icon(Icons.Default.Build, contentDescription = null) },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Server Stats") },
+                                    onClick = {
+                                        showMenu = false
+                                        showStatsSheet = true
+                                    },
+                                    leadingIcon = { Icon(Icons.Default.MonitorHeart, contentDescription = null) },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Detach tmux Client") },
+                                    onClick = {
+                                        showMenu = false
+                                        currentBridge?.let {
+                                            TmuxRemoteController.detachCurrentClient(it)
+                                            coroutineScope.launch {
+                                                snackbarHostState.showSnackbar("Sent client-only detach (Ctrl-B d)")
+                                            }
+                                        }
+                                    },
+                                    leadingIcon = { Icon(Icons.AutoMirrored.Filled.ExitToApp, contentDescription = null) },
                                 )
                             }
 

@@ -87,7 +87,7 @@ android {
     dynamicFeatures += setOf(":mosh")
 
     defaultConfig {
-        applicationId = "org.connectbot"
+        applicationId = "com.paullmssh.android"
 
         minSdk =
             libs.versions.minSdk
@@ -163,7 +163,7 @@ android {
             testProguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard.cfg", "proguard-tests.cfg")
 
             applicationIdSuffix = ".debug"
-            enableAndroidTestCoverage = true
+            enableAndroidTestCoverage = false
         }
     }
 

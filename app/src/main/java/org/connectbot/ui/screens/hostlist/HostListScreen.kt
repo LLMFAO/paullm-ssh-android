@@ -91,6 +91,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.connectbot.R
 import org.connectbot.data.EntityIds
+import org.connectbot.paullm.PaullmSecurityDialog
 import org.connectbot.data.JsonImportReader
 import org.connectbot.data.JsonImportTooLargeException
 import org.connectbot.data.entity.Host
@@ -303,7 +304,15 @@ fun HostListScreenContent(
 ) {
     var showMenu by remember { mutableStateOf(false) }
     var showDisconnectAllDialog by remember { mutableStateOf(false) }
+    var showSecurityDialog by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
+
+    if (showSecurityDialog) {
+        PaullmSecurityDialog(
+            onOpenSettings = onNavigateToSettings,
+            onDismiss = { showSecurityDialog = false },
+        )
+    }
 
     // Show snackbar when there's an error
     LaunchedEffect(uiState.error) {
@@ -344,6 +353,13 @@ fun HostListScreenContent(
                                 onClick = {
                                     showMenu = false
                                     onToggleSortOrder()
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Privacy & Lock") },
+                                onClick = {
+                                    showMenu = false
+                                    showSecurityDialog = true
                                 },
                             )
                             DropdownMenuItem(

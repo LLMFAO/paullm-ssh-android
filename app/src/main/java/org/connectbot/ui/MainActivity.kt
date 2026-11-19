@@ -63,6 +63,7 @@ import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.launch
 import org.connectbot.R
 import org.connectbot.data.entity.Host
+import org.connectbot.paullm.PaullmPrivacy
 import org.connectbot.fido2.Fido2Manager
 import org.connectbot.service.ConnectionNotifier
 import org.connectbot.service.TerminalManager
@@ -153,6 +154,7 @@ class MainActivity : AppCompatActivity() {
             ),
         )
         super.onCreate(savedInstanceState)
+        PaullmPrivacy.applyWindowPrivacy(this)
 
         appViewModel = ViewModelProvider(this)[AppViewModel::class.java]
 

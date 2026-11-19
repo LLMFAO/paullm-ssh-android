@@ -27,6 +27,13 @@
 	<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 	<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 	<uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
+	<uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+	<queries>
+		<intent>
+			<action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+		</intent>
+	</queries>
 
 	<!-- FIDO2 security key support -->
 	<uses-permission android:name="android.permission.NFC" />
@@ -117,6 +124,16 @@
 				android:name="autoStoreLocales"
 				android:value="true" />
 		</service>
+
+		<provider
+			android:name="androidx.core.content.FileProvider"
+			android:authorities="${applicationId}.paullm.fileprovider"
+			android:exported="false"
+			android:grantUriPermissions="true">
+			<meta-data
+				android:name="android.support.FILE_PROVIDER_PATHS"
+				android:resource="@xml/paullm_file_paths" />
+		</provider>
 
 		<meta-data
 			android:name="com.google.android.backup.api_key"

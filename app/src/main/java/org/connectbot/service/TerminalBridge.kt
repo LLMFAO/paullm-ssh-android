@@ -72,6 +72,9 @@ import org.connectbot.terminal.TerminalDimensions
 import org.connectbot.terminal.TerminalEmulator
 import org.connectbot.terminal.TerminalEmulatorFactory
 import org.connectbot.terminal.UrlScanScope
+import org.connectbot.paullm.SshExecResult
+import org.connectbot.sshlib.SftpClient
+import org.connectbot.sshlib.SftpResult
 import org.connectbot.transport.AbsTransport
 import org.connectbot.transport.TransportFactory
 import org.connectbot.util.HostConstants
@@ -947,6 +950,18 @@ class TerminalBridge {
 
     fun writeToTransport(c: Int) {
         enqueueTransportOperation(TransportOperation.WriteData(byteArrayOf(c.toByte())))
+    }
+
+    fun supportsRemoteTools(): Boolean = transport?.supportsRemoteTools() == true
+
+    suspend fun execCommand(command: String, timeoutMs: Long = 10_000L): SshExecResult {
+        val active = transport ?: return SshExecResult(error = "Not connected")
+        return active.execCommand(command, timeoutMs)
+    }
+
+    suspend fun openSftpClient(): SftpResult<SftpClient> {
+        val active = transport ?: return SftpResult.ProtocolError("Not connected")
+        return active.openSftpClient()
     }
 
     private data class ConfiguredInput(
