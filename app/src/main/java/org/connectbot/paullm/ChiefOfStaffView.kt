@@ -218,6 +218,7 @@ object ChiefOfStaffEngine {
         - Cite exact session names, branch/dir context, and real errors from the captured output.
         - Never invent progress or hide failures.
         - Write `reply` in clean human-readable prose/bullets (never dump raw JSON inside `reply`).
+        - Do NOT run slow shell/file tools when the live `tmux` snapshot already answers the user's question.
     """.trimIndent()
 
     private val PYTHON_RUNNER = """
@@ -347,8 +348,20 @@ def capture_tmux():
         })
     return snap
 
+def resolve_agy_bin():
+    home = pathlib.Path.home()
+    preferred = [
+        home / ".local/share/mise/installs/antigravity-cli/latest/agy",
+        home / ".local/share/mise/shims/agy",
+        home / ".local/bin/agy",
+    ]
+    for p in preferred:
+        if p.exists() and os.access(p, os.X_OK):
+            return str(p)
+    return shutil.which("agy")
+
 def try_agy(model, prompt, schema_path, cos_dir, conv_id, allow_tools=False, timeout_s=75):
-    agy_bin = shutil.which("agy")
+    agy_bin = resolve_agy_bin()
     if not agy_bin:
         raise RuntimeError("agy CLI not found")
     cmd = [
@@ -494,7 +507,7 @@ def main():
     order = {
         "auto": ["agy_flash", "ollama", "pi", "claude", "codex"],
         "agy_flash": ["agy_flash"],
-        "agy_orch": ["agy_orch"],
+        "agy_orch": ["agy_orch_neon", "agy_orch_argon", "agy_neon_low"],
         "ollama": ["ollama"],
         "pi": ["pi"],
         "claude": ["claude"],
@@ -505,8 +518,12 @@ def main():
         try:
             if step == "agy_flash":
                 result = try_agy("gemini-3.8-flash-low", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=False, timeout_s=55)
-            elif step == "agy_orch":
-                result = try_agy("gemini-pro-orchestrator-neon", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=110)
+            elif step == "agy_orch_neon":
+                result = try_agy("gemini-pro-orchestrator-neon", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=135)
+            elif step == "agy_orch_argon":
+                result = try_agy("gemini-pro-orchestrator-g1-pro", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=135)
+            elif step == "agy_neon_low":
+                result = try_agy("gemini-4-neon-low", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=75)
             elif step == "ollama":
                 result = try_ollama(system_prompt, user_prompt)
             elif step == "pi":
@@ -627,7 +644,7 @@ if __name__ == "__main__":
             python3 "${'$'}HOME/.config/paullm-cos/cos_runner.py" '$reqB64'
         """.trimIndent()
 
-        val timeoutMs = if (backend == CosBackend.AGY_ORCH) 130_000L else 95_000L
+        val timeoutMs = if (backend == CosBackend.AGY_ORCH) 155_000L else 95_000L
         val res = bridge.execCommand(PaullmShell.wrapLoginShell(script), timeoutMs = timeoutMs)
         if (res.error != null) {
             return Result.failure(IllegalStateException(res.error))
@@ -708,7 +725,16 @@ if __name__ == "__main__":
                     val urgency = SessionUrgency.parse(s.optString("status"))
                     val summary = s.optString("summary").trim()
                     val decision = s.optString("decision_needed").trim()
-                        .takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+                        .takeIf { raw ->
+                            raw.isNotEmpty() &&
+                                !raw.equals("null", ignoreCase = true) &&
+                                !raw.equals("none", ignoreCase = true) &&
+                                !raw.equals("n/a", ignoreCase = true) &&
+                                !raw.startsWith("none;", ignoreCase = true) &&
+                                !raw.startsWith("none.", ignoreCase = true) &&
+                                !raw.startsWith("none —", ignoreCase = true) &&
+                                !raw.startsWith("none -", ignoreCase = true)
+                        }
                     val actions = parseActions(s.optJSONArray("suggested_actions"), sName)
                     parsedSessions.add(
                         CosSessionDecision(

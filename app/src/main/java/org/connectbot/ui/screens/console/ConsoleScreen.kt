@@ -1452,7 +1452,12 @@ fun ConsoleScreen(
                             messages = cosMessages,
                             selectedBackend = cosBackend,
                             isRunning = cosRunning,
-                            onSelectBackend = { cosBackend = it },
+                            onSelectBackend = { nextBackend ->
+                                if (nextBackend != cosBackend) {
+                                    cosBackend = nextBackend
+                                    cosConversationId = null
+                                }
+                            },
                             onSendPrompt = { promptText -> triggerCosPrompt(activeBridge, promptText) },
                             onClearChat = {
                                 cosMessages = emptyList()

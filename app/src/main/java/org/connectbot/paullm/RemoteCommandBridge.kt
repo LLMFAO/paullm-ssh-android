@@ -47,7 +47,7 @@ enum class TerminalSendMode(
 
 object PaullmShell {
     const val PATH_EXPORT =
-        "export PATH=\"\$HOME/.grok/bin:\$HOME/.local/bin:\$HOME/.npm-global/bin:\$HOME/.cargo/bin:\$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH\""
+        "export PATH=\"\$HOME/.local/share/mise/shims:\$HOME/.local/share/mise/installs/antigravity-cli/latest:\$HOME/.grok/bin:\$HOME/.local/bin:\$HOME/.npm-global/bin:\$HOME/.cargo/bin:\$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH\""
 
     fun quote(value: String): String = "'" + value.replace("'", "'\"'\"'") + "'"
 
