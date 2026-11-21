@@ -211,7 +211,9 @@ import org.connectbot.util.rememberTerminalTypefaceResultFromStoredValue
 import org.connectbot.util.terminalTypefaceWithWeight
 import timber.log.Timber
 import java.util.UUID
+import androidx.compose.ui.geometry.Offset
 import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -414,26 +416,49 @@ internal fun shouldPreserveSoftwareKeyboardForBridgeChange(
 private fun Modifier.sessionSwipeNavigation(
     currentIndex: Int,
     sessionCount: Int,
-    selectionActive: Boolean,
+    isSelectionActive: () -> Boolean,
     onSwipeToSession: (Int) -> Unit,
     onInteraction: () -> Unit,
-): Modifier = pointerInput(currentIndex, sessionCount, selectionActive) {
-    if (selectionActive) {
-        return@pointerInput
-    }
+): Modifier = pointerInput(currentIndex, sessionCount) {
+    var lastTapUpTimeMs = 0L
+    var lastTapUpPos = Offset.Zero
 
     awaitEachGesture {
         val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
         val pointerId = down.id
+        val downTimeMs = down.uptimeMillis
+        val downPos = down.position
+        val touchSlop = viewConfiguration.touchSlop
+        val longPressCutoffMs = (viewConfiguration.longPressTimeoutMillis - 40L).coerceAtLeast(180L)
+
+        val isDoubleTapCandidate = lastTapUpTimeMs > 0L &&
+            (downTimeMs - lastTapUpTimeMs) <= viewConfiguration.doubleTapTimeoutMillis &&
+            hypot((downPos.x - lastTapUpPos.x).toDouble(), (downPos.y - lastTapUpPos.y).toDouble()) <= touchSlop * 2.5
+
         var dragX = 0f
         var dragY = 0f
         var horizontalSwipeLocked = false
         var verticalGestureLocked = false
+        var yieldedToSelection = isSelectionActive() || isDoubleTapCandidate
 
         while (true) {
             val event = awaitPointerEvent(PointerEventPass.Initial)
+            if (event.changes.count { it.pressed } > 1) {
+                horizontalSwipeLocked = false
+                break
+            }
             val change = event.changes.firstOrNull { it.id == pointerId } ?: break
             if (!change.pressed) {
+                val elapsedMs = change.uptimeMillis - downTimeMs
+                if (!horizontalSwipeLocked && !verticalGestureLocked &&
+                    abs(dragX) <= touchSlop && abs(dragY) <= touchSlop &&
+                    elapsedMs < viewConfiguration.longPressTimeoutMillis
+                ) {
+                    lastTapUpTimeMs = change.uptimeMillis
+                    lastTapUpPos = change.position
+                } else {
+                    lastTapUpTimeMs = 0L
+                }
                 break
             }
 
@@ -441,12 +466,26 @@ private fun Modifier.sessionSwipeNavigation(
             dragX += delta.x
             dragY += delta.y
 
+            if (yieldedToSelection) {
+                continue
+            }
+
+            if (isSelectionActive()) {
+                yieldedToSelection = true
+                horizontalSwipeLocked = false
+                continue
+            }
+
             if (!horizontalSwipeLocked && !verticalGestureLocked) {
+                if ((change.uptimeMillis - downTimeMs) >= longPressCutoffMs) {
+                    yieldedToSelection = true
+                    continue
+                }
                 val absX = abs(dragX)
                 val absY = abs(dragY)
-                if (absX > viewConfiguration.touchSlop && absX > absY * 1.5f) {
+                if (absX > touchSlop && absX > absY * 1.5f) {
                     horizontalSwipeLocked = true
-                } else if (absY > viewConfiguration.touchSlop && absY > absX) {
+                } else if (absY > touchSlop && absY > absX) {
                     verticalGestureLocked = true
                 }
             }
@@ -456,15 +495,15 @@ private fun Modifier.sessionSwipeNavigation(
             }
         }
 
-        if (horizontalSwipeLocked) {
+        if (horizontalSwipeLocked && !isSelectionActive()) {
             sessionSwipeTarget(
                 currentIndex = currentIndex,
                 sessionCount = sessionCount,
                 dragX = dragX,
                 dragY = dragY,
                 viewportWidth = size.width,
-                touchSlop = viewConfiguration.touchSlop,
-                selectionActive = selectionActive,
+                touchSlop = touchSlop,
+                selectionActive = false,
             )?.let { target ->
                 onInteraction()
                 onSwipeToSession(target)
@@ -827,8 +866,8 @@ fun ConsoleScreen(
         }
     }
     var scannedUrls by remember { mutableStateOf<List<String>>(emptyList()) }
-    var selectionController by remember { mutableStateOf<SelectionController?>(null) }
-    var composeController by remember { mutableStateOf<ComposeController?>(null) }
+    var selectionControllerEntry by remember { mutableStateOf<Pair<UUID, SelectionController>?>(null) }
+    var composeControllerEntry by remember { mutableStateOf<Pair<UUID, ComposeController>?>(null) }
     var imeVisible by remember { mutableStateOf(false) }
     var keyboardScrollInProgress by remember { mutableStateOf(false) }
     var previousBridgeIdForImeState by remember { mutableStateOf<UUID?>(null) }
@@ -840,6 +879,12 @@ fun ConsoleScreen(
         .getOrNull(uiState.currentBridgeIndex)
     currentBridge?.takeIf { it.transport?.supportsZmodem == true }?.let { key(it) { ZmodemTransferDialog(it) } }
     val currentBridgeId = currentBridge?.sessionUuid
+    val selectionController = selectionControllerEntry
+        ?.takeIf { it.first == currentBridgeId }
+        ?.second
+    val composeController = composeControllerEntry
+        ?.takeIf { it.first == currentBridgeId }
+        ?.second
     var fontSizeNotice by remember(currentBridge) { mutableStateOf<FontSizeNoticeState?>(null) }
     val activeProfile by currentBridge?.activeProfile?.collectAsState() ?: remember { mutableStateOf(null) }
     val accessibilityManager = LocalAccessibilityManager.current
@@ -1103,7 +1148,6 @@ fun ConsoleScreen(
 
     val hasMultipleSessions = uiState.bridges.size > 1 && !uiState.isLoading
     val swipeBetweenSessions = swipeSessionsEnabled && hasMultipleSessions
-    val terminalSelectionActive = selectionController?.isSelectionActive == true
     // These values are computed from bridge state and will recompute when uiState.revision changes
     val sessionOpen = currentBridge?.isSessionOpen == true
     val disconnected = currentBridge?.isDisconnected == true
@@ -1146,10 +1190,8 @@ fun ConsoleScreen(
         previousSessionOpen = sessionOpen
     }
 
-    // Reset selection and compose controllers when bridge changes
+    // Focus terminal when bridge changes (controllers are sessionUuid-scoped so never raced to null)
     LaunchedEffect(currentBridge) {
-        selectionController = null
-        composeController = null
         if (currentBridge != null) {
             termFocusRequester.requestFocus()
         }
@@ -1368,12 +1410,17 @@ fun ConsoleScreen(
                                 .weight(1f),
                         ) {
                         val bridge = uiState.bridges[uiState.currentBridgeIndex]
-                        val tuiModes by bridge.terminalModeTracker.modes.collectAsState()
+                        val isSelectionActiveCheck: () -> Boolean = {
+                            selectionControllerEntry
+                                ?.takeIf { it.first == bridge.sessionUuid }
+                                ?.second
+                                ?.isSelectionActive == true
+                        }
                         val swipeModifier = if (swipeBetweenSessions) {
                             Modifier.sessionSwipeNavigation(
                                 currentIndex = uiState.currentBridgeIndex,
                                 sessionCount = uiState.bridges.size,
-                                selectionActive = terminalSelectionActive,
+                                isSelectionActive = isSelectionActiveCheck,
                                 onSwipeToSession = { index -> selectBridgePreservingKeyboard(index) },
                                 onInteraction = { handleTerminalInteraction(isInteraction = false) },
                             )
@@ -1382,8 +1429,7 @@ fun ConsoleScreen(
                         }
                         val terminalModifier = swipeModifier.tuiTouchScroll(
                             bridge = bridge,
-                            modes = tuiModes,
-                            selectionActive = terminalSelectionActive,
+                            isSelectionActive = isSelectionActiveCheck,
                             onInteraction = { handleTerminalInteraction(isInteraction = false) },
                         )
 
@@ -1419,8 +1465,8 @@ fun ConsoleScreen(
                                     keyboardScrollInProgress = inProgress
                                     handleTerminalInteraction(isInteraction = inProgress, resetTitleBarTimer = false)
                                 },
-                                onSelectionControllerChange = { selectionController = it },
-                                onComposeControllerChange = { composeController = it },
+                                onSelectionControllerChange = { selectionControllerEntry = bridge.sessionUuid to it },
+                                onComposeControllerChange = { composeControllerEntry = bridge.sessionUuid to it },
                                 onOpenUrl = ::openUrl,
                                 onPasteRequest = ::pasteClipboardContents,
                                 onInterceptKey = handleShortcut,

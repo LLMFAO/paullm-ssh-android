@@ -3,6 +3,7 @@ package org.connectbot.paullm
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
@@ -11,6 +12,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.connectbot.service.TerminalBridge
 import kotlin.math.abs
+import kotlin.math.hypot
 
 data class TerminalInteractionModes(
     val mouseTracking: Boolean = false,
@@ -172,21 +174,39 @@ fun sendTuiScrollStep(
 
 fun Modifier.tuiTouchScroll(
     bridge: TerminalBridge,
-    modes: TerminalInteractionModes,
-    selectionActive: Boolean,
+    isSelectionActive: () -> Boolean,
     onInteraction: () -> Unit,
 ): Modifier {
-    val active = (modes.shouldForwardTouchScroll || bridge.tmuxSessionName != null) && !selectionActive
-    if (!active) return this
+    // Keep a stable pointerInput node keyed only on sessionUuid so toggling text selection
+    // or terminal modes NEVER mutates Terminal's Modifier chain mid-gesture.
+    return pointerInput(bridge.sessionUuid) {
+        var lastTapUpTimeMs = 0L
+        var lastTapUpPos = Offset.Zero
 
-    return pointerInput(bridge.sessionUuid, selectionActive) {
         awaitEachGesture {
             val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
             val pointerId = down.id
+            val downTimeMs = down.uptimeMillis
+            val downPos = down.position
+            val touchSlop = viewConfiguration.touchSlop
+            val longPressCutoffMs = (viewConfiguration.longPressTimeoutMillis - 40L).coerceAtLeast(180L)
+
+            val isDoubleTapCandidate = lastTapUpTimeMs > 0L &&
+                (downTimeMs - lastTapUpTimeMs) <= viewConfiguration.doubleTapTimeoutMillis &&
+                hypot((downPos.x - lastTapUpPos.x).toDouble(), (downPos.y - lastTapUpPos.y).toDouble()) <= touchSlop * 2.5
+
+            // Never intercept while selection is active, on double-tap-drag selection,
+            // or when the session is in plain scrollback mode.
+            val scrollForwardingEligible = (
+                bridge.terminalModeTracker.modes.value.shouldForwardTouchScroll ||
+                    bridge.tmuxSessionName != null
+                ) && !isSelectionActive() && !isDoubleTapCandidate
+
             var totalX = 0f
             var totalY = 0f
             var verticalLocked = false
             var horizontalLocked = false
+            var yieldedToSelection = !scrollForwardingEligible
             var wheelAccumulator = 0f
 
             val dims = bridge.terminalDimensions.value
@@ -205,19 +225,48 @@ fun Modifier.tuiTouchScroll(
                     break
                 }
                 val change = event.changes.firstOrNull { it.id == pointerId } ?: break
-                if (!change.pressed) break
+                if (!change.pressed) {
+                    val elapsedMs = change.uptimeMillis - downTimeMs
+                    if (!verticalLocked && !horizontalLocked &&
+                        abs(totalX) <= touchSlop && abs(totalY) <= touchSlop &&
+                        elapsedMs < viewConfiguration.longPressTimeoutMillis
+                    ) {
+                        lastTapUpTimeMs = change.uptimeMillis
+                        lastTapUpPos = change.position
+                    } else {
+                        lastTapUpTimeMs = 0L
+                    }
+                    break
+                }
 
                 val delta = change.positionChange()
                 totalX += delta.x
                 totalY += delta.y
 
+                if (yieldedToSelection) {
+                    continue
+                }
+
+                // Yield immediately if termlib activated selection (long-press / double-tap / handle drag)
+                if (isSelectionActive()) {
+                    yieldedToSelection = true
+                    verticalLocked = false
+                    continue
+                }
+
                 if (!verticalLocked && !horizontalLocked) {
+                    // If finger was held still long enough to trigger long-press selection,
+                    // never steal the subsequent drag.
+                    if ((change.uptimeMillis - downTimeMs) >= longPressCutoffMs) {
+                        yieldedToSelection = true
+                        continue
+                    }
                     val absX = abs(totalX)
                     val absY = abs(totalY)
-                    if (absY > viewConfiguration.touchSlop && absY > absX * 1.15f) {
+                    if (absY > touchSlop && absY > absX * 1.15f) {
                         verticalLocked = true
                         onInteraction()
-                    } else if (absX > viewConfiguration.touchSlop && absX > absY * 1.3f) {
+                    } else if (absX > touchSlop && absX > absY * 1.3f) {
                         horizontalLocked = true
                     }
                 }
