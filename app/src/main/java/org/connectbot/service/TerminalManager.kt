@@ -63,7 +63,10 @@ import org.connectbot.data.entity.Host
 import org.connectbot.data.entity.Pubkey
 import org.connectbot.di.CoroutineDispatchers
 import org.connectbot.fido2.Fido2Manager
+import org.connectbot.sshlib.SshClient
 import org.connectbot.sshlib.SshSigning
+import org.connectbot.transport.AbsTransport
+import org.connectbot.transport.SSH
 import org.connectbot.transport.TransportFactory
 import org.connectbot.util.CryptoProviderState
 import org.connectbot.util.PreferenceConstants
@@ -487,6 +490,100 @@ class TerminalManager :
         return openConnection(host)
     }
 
+    fun findAuthenticatedSshClient(hostId: UUID, excluding: AbsTransport? = null): SshClient? {
+        synchronized(_bridges) {
+            for (b in _bridges) {
+                if (b.host.id != hostId || b.isDisconnected) continue
+                val t = b.transport
+                if (t === excluding) continue
+                val ssh = t as? SSH ?: continue
+                val active = ssh.activeSshClient()
+                if (active != null) return active
+            }
+        }
+        return null
+    }
+
+    fun isSshClientStillUsed(sshClient: SshClient, excluding: AbsTransport? = null): Boolean {
+        synchronized(_bridges) {
+            return _bridges.any { b ->
+                val t = b.transport
+                t !== excluding && (t as? SSH)?.activeSshClient() === sshClient
+            }
+        }
+    }
+
+    /**
+     * Opens (or reuses an already open) dedicated terminal tab directly attached to a remote tmux session.
+     * Multiplexes over the host's authenticated SSH connection when available so no extra auth prompt occurs.
+     */
+    fun openTmuxSession(host: Host, tmuxSessionName: String): TerminalBridge {
+        synchronized(_bridges) {
+            val existing = _bridges.firstOrNull {
+                it.host.id == host.id && it.tmuxSessionName == tmuxSessionName && !it.isDisconnected
+            }
+            if (existing != null) {
+                return existing
+            }
+        }
+
+        val bridge = TerminalBridge(this, host, dispatchers, tmuxSessionName = tmuxSessionName)
+        bridge.setOnDisconnectedListener(this)
+        bridge.startConnection()
+
+        synchronized(_bridges) {
+            _bridges.add(bridge)
+            if (hostBridgeMap[bridge.host]?.get() == null) {
+                val wr = WeakReference(bridge)
+                hostBridgeMap[bridge.host] = wr
+                nicknameBridgeMap[bridge.host.nickname] = wr
+            }
+            _bridgesFlow.value = _bridges.toList()
+        }
+
+        synchronized(_disconnected) {
+            _disconnected.remove(bridge.host)
+            _disconnectedFlow.value = _disconnected.toList()
+        }
+
+        if (bridge.isUsingNetwork()) {
+            connectivityMonitor.incRef()
+        }
+
+        connectionNotifier.showRunningNotification(this, notificationSessions())
+        touchHost(host)
+        notifyHostStatusChanged()
+        return bridge
+    }
+
+    /**
+     * Opens an additional independent shell tab on the same host.
+     */
+    fun openAdditionalShell(host: Host): TerminalBridge {
+        val bridge = TerminalBridge(this, host, dispatchers, tmuxSessionName = null)
+        bridge.setOnDisconnectedListener(this)
+        bridge.startConnection()
+
+        synchronized(_bridges) {
+            _bridges.add(bridge)
+            if (hostBridgeMap[bridge.host]?.get() == null) {
+                val wr = WeakReference(bridge)
+                hostBridgeMap[bridge.host] = wr
+                nicknameBridgeMap[bridge.host.nickname] = wr
+            }
+            _bridgesFlow.value = _bridges.toList()
+        }
+
+        if (bridge.isUsingNetwork()) {
+            connectivityMonitor.incRef()
+        }
+
+        connectionNotifier.showRunningNotification(this, notificationSessions())
+        touchHost(host)
+        notifyHostStatusChanged()
+        return bridge
+    }
+
     /**
      * Update the last-connected value for the given nickname by passing through
      * to [HostRepository].
@@ -531,8 +628,15 @@ class TerminalManager :
             // remove this bridge from our list
             _bridges.remove(bridge)
 
-            hostBridgeMap.remove(bridge.host)
-            nicknameBridgeMap.remove(bridge.host.nickname)
+            val remainingForHost = _bridges.firstOrNull { it.host.id == bridge.host.id }
+            if (remainingForHost != null) {
+                val wr = WeakReference(remainingForHost)
+                hostBridgeMap[bridge.host] = wr
+                nicknameBridgeMap[bridge.host.nickname] = wr
+            } else {
+                hostBridgeMap.remove(bridge.host)
+                nicknameBridgeMap.remove(bridge.host.nickname)
+            }
 
             if (bridge.isUsingNetwork()) {
                 connectivityMonitor.decRef()

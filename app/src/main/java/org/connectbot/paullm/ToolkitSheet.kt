@@ -1,5 +1,6 @@
 package org.connectbot.paullm
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -13,6 +14,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.CheckCircle
@@ -23,6 +25,7 @@ import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -43,6 +46,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -60,12 +64,12 @@ data class VibeToolSpec(
     val id: String,
     val name: String,
     val group: ToolGroup,
+    val vendor: AiVendor,
     val summary: String,
     val detectCmd: String,
     val installCmd: String,
     val authCmd: String? = null,
     val launchPreset: TmuxLaunchPreset? = null,
-    val launchBinary: String? = null,
 )
 
 object VibeToolRegistry {
@@ -74,68 +78,82 @@ object VibeToolRegistry {
             id = "claude",
             name = "Claude Code",
             group = ToolGroup.AI_CLI,
-            summary = "Anthropic terminal coding agent (npm).",
+            vendor = AiVendor.CLAUDE,
+            summary = "Anthropic terminal coding agent.",
             detectCmd = "command -v claude >/dev/null 2>&1 && echo __OK__",
             installCmd = "npm install -g @anthropic-ai/claude-code",
             authCmd = "claude auth login",
             launchPreset = TmuxLaunchPreset.CLAUDE,
-            launchBinary = "claude",
         ),
         VibeToolSpec(
             id = "codex",
             name = "Codex CLI",
             group = ToolGroup.AI_CLI,
-            summary = "OpenAI terminal coding agent (npm).",
+            vendor = AiVendor.CODEX,
+            summary = "OpenAI terminal coding agent.",
             detectCmd = "command -v codex >/dev/null 2>&1 && echo __OK__",
             installCmd = "npm install -g @openai/codex",
             authCmd = "codex login --device-auth",
             launchPreset = TmuxLaunchPreset.CODEX,
-            launchBinary = "codex",
+        ),
+        VibeToolSpec(
+            id = "grok",
+            name = "Grok CLI",
+            group = ToolGroup.AI_CLI,
+            vendor = AiVendor.GROK,
+            summary = "xAI Grok terminal coding agent.",
+            detectCmd = "command -v grok >/dev/null 2>&1 && echo __OK__",
+            installCmd = "npm install -g @xai-official/grok",
+            authCmd = "grok",
+            launchPreset = TmuxLaunchPreset.GROK,
         ),
         VibeToolSpec(
             id = "opencode",
             name = "OpenCode CLI",
             group = ToolGroup.AI_CLI,
-            summary = "Open-source multi-model coding CLI (npm).",
+            vendor = AiVendor.OPENCODE,
+            summary = "Open-source multi-model coding CLI.",
             detectCmd = "command -v opencode >/dev/null 2>&1 && echo __OK__",
             installCmd = "npm install -g opencode-ai",
             authCmd = "opencode auth login",
             launchPreset = TmuxLaunchPreset.OPENCODE,
-            launchBinary = "opencode",
         ),
         VibeToolSpec(
             id = "antigravity",
             name = "Antigravity CLI",
             group = ToolGroup.AI_CLI,
+            vendor = AiVendor.ANTIGRAVITY,
             summary = "Google Antigravity agent CLI (agy).",
             detectCmd = "command -v agy >/dev/null 2>&1 && echo __OK__",
             installCmd = "curl -fsSL https://antigravity.google/cli/install.sh | bash",
             authCmd = "agy",
             launchPreset = TmuxLaunchPreset.ANTIGRAVITY,
-            launchBinary = "agy",
         ),
         VibeToolSpec(
             id = "aider",
             name = "Aider",
             group = ToolGroup.AI_CLI,
+            vendor = AiVendor.AIDER,
             summary = "Git-native AI pair programmer (pip).",
             detectCmd = "command -v aider >/dev/null 2>&1 && echo __OK__",
             installCmd = "pip install aider-chat",
-            launchBinary = "aider",
+            launchPreset = TmuxLaunchPreset.AIDER,
         ),
         VibeToolSpec(
             id = "goose",
             name = "Goose",
             group = ToolGroup.AI_CLI,
+            vendor = AiVendor.GOOSE,
             summary = "Extensible developer agent CLI.",
             detectCmd = "command -v goose >/dev/null 2>&1 && echo __OK__",
             installCmd = "curl -fsSL https://github.com/block/goose/releases/latest/download/install.sh | bash",
-            launchBinary = "goose",
+            launchPreset = TmuxLaunchPreset.GOOSE,
         ),
         VibeToolSpec(
             id = "agents-md",
             name = "Project AGENTS.md",
             group = ToolGroup.TEMPLATES,
+            vendor = AiVendor.SHELL,
             summary = "Creates an AGENTS.md guide in the current folder.",
             detectCmd = "test -f AGENTS.md && echo __OK__",
             installCmd = "cat > AGENTS.md <<'EOF'\n# Project Agent Guide\n\n## Stack\n- \n\n## Conventions\n- Keep commits focused.\n- Run tests after edits.\nEOF",
@@ -144,6 +162,7 @@ object VibeToolRegistry {
             id = "memory-vault",
             name = "AI Memory Folder",
             group = ToolGroup.TEMPLATES,
+            vendor = AiVendor.TMUX,
             summary = "Creates docs/ai/context.md for durable project notes.",
             detectCmd = "test -f docs/ai/context.md && echo __OK__",
             installCmd = "mkdir -p docs/ai && cat > docs/ai/context.md <<'EOF'\n# Project Context\n\n## Architecture\n- \n\n## Decisions\n- \nEOF",
@@ -164,6 +183,7 @@ object VibeToolRegistry {
 @Composable
 fun ToolkitSheet(
     bridge: TerminalBridge,
+    onOpenTmuxTab: (String) -> Unit,
     onDismiss: () -> Unit,
     onMessage: (String) -> Unit,
 ) {
@@ -188,10 +208,10 @@ fun ToolkitSheet(
     confirmInstall?.let { tool ->
         AlertDialog(
             onDismissRequest = { confirmInstall = null },
-            title = { Text("Run installer in terminal?") },
+            title = { Text("Install ${tool.name}?") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("This will run the following command in your active SSH session:")
+                    Text("Runs inside a dedicated tmux setup tab so your current session stays untouched:")
                     Text(
                         tool.installCmd,
                         fontFamily = FontFamily.Monospace,
@@ -203,12 +223,26 @@ fun ToolkitSheet(
                 Button(
                     onClick = {
                         confirmInstall = null
-                        bridge.injectString("${tool.installCmd}\r")
-                        onMessage("Running ${tool.name} setup in terminal")
-                        onDismiss()
+                        scope.launch {
+                            val setupName = "setup-${tool.id}"
+                            TmuxRemoteController.createDetachedSession(
+                                bridge = bridge,
+                                rawName = setupName,
+                                preset = TmuxLaunchPreset.SHELL,
+                                customCommand = tool.installCmd,
+                            ).onSuccess {
+                                onOpenTmuxTab(it)
+                                onMessage("Opened setup tab '$it'")
+                                onDismiss()
+                            }.onFailure {
+                                bridge.injectString("${tool.installCmd}\r")
+                                onMessage("Running ${tool.name} setup in terminal")
+                                onDismiss()
+                            }
+                        }
                     },
                 ) {
-                    Text("Run")
+                    Text("Install")
                 }
             },
             dismissButton = {
@@ -241,9 +275,9 @@ fun ToolkitSheet(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Build, contentDescription = null)
+                    Icon(Icons.Default.Build, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                     Spacer(Modifier.width(8.dp))
-                    Text("AI Vibe Toolkit", style = MaterialTheme.typography.titleLarge)
+                    Text("AI Vibe Toolkit", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
                 }
                 IconButton(onClick = ::scan, enabled = !scanning) {
                     if (scanning) {
@@ -272,75 +306,93 @@ fun ToolkitSheet(
             LazyColumn(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 420.dp),
+                    .heightIn(max = 440.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(visibleTools, key = { it.id }) { tool ->
                     val installed = installedMap[tool.id] == true
-                    Card(modifier = Modifier.fillMaxWidth()) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(
+                            1.dp,
+                            if (installed) tool.vendor.accent.copy(alpha = 0.5f) else MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
+                        ),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                        ),
+                    ) {
                         Column(
                             modifier = Modifier.padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.SpaceBetween,
                             ) {
-                                Text(tool.name, style = MaterialTheme.typography.titleMedium)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    AiVendorBadge(vendor = tool.vendor, size = 32.dp)
+                                    Spacer(Modifier.width(10.dp))
+                                    Column {
+                                        Text(tool.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            tool.summary,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
                                 if (installed) {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
                                         Icon(
                                             Icons.Default.CheckCircle,
                                             contentDescription = "Installed",
-                                            tint = MaterialTheme.colorScheme.primary,
+                                            tint = MaterialTheme.colorScheme.tertiary,
                                             modifier = Modifier.size(16.dp),
                                         )
                                         Spacer(Modifier.width(4.dp))
                                         Text(
-                                            "Installed",
+                                            "Ready",
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.primary,
+                                            color = MaterialTheme.colorScheme.tertiary,
                                         )
                                     }
                                 } else {
                                     Text(
-                                        if (scanning) "Checking..." else "Not detected",
+                                        if (scanning) "..." else "Missing",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 }
                             }
 
-                            Text(
-                                tool.summary,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                if (installed && (tool.launchPreset != null || tool.launchBinary != null)) {
+                                val preset = tool.launchPreset
+                                if (installed && preset != null) {
                                     Button(
                                         onClick = {
-                                            if (tool.launchPreset != null) {
-                                                TmuxRemoteController.createAndAttach(
-                                                    bridge,
-                                                    tool.launchPreset.defaultName,
-                                                    tool.launchPreset,
-                                                )
-                                            } else {
-                                                bridge.injectString("${tool.launchBinary}\r")
+                                            scope.launch {
+                                                TmuxRemoteController.createDetachedSession(
+                                                    bridge = bridge,
+                                                    rawName = preset.defaultName,
+                                                    preset = preset,
+                                                ).onSuccess { name ->
+                                                    onOpenTmuxTab(name)
+                                                    onMessage("Opened ${tool.name} in tab '$name'")
+                                                    onDismiss()
+                                                }.onFailure { err ->
+                                                    onMessage(err.message ?: "Failed to launch ${tool.name}")
+                                                }
                                             }
-                                            onMessage("Launching ${tool.name}")
-                                            onDismiss()
                                         },
                                     ) {
                                         Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
                                         Spacer(Modifier.width(4.dp))
-                                        Text("Launch")
+                                        Text("Launch Tab")
                                     }
                                 }
 
@@ -353,9 +405,22 @@ fun ToolkitSheet(
                                 tool.authCmd?.let { auth ->
                                     OutlinedButton(
                                         onClick = {
-                                            bridge.injectString("$auth\r")
-                                            onMessage("Running ${tool.name} login")
-                                            onDismiss()
+                                            scope.launch {
+                                                val authTab = "auth-${tool.id}"
+                                                TmuxRemoteController.createDetachedSession(
+                                                    bridge = bridge,
+                                                    rawName = authTab,
+                                                    preset = TmuxLaunchPreset.SHELL,
+                                                    customCommand = auth,
+                                                ).onSuccess {
+                                                    onOpenTmuxTab(it)
+                                                    onMessage("Opened auth tab '$it'")
+                                                    onDismiss()
+                                                }.onFailure {
+                                                    bridge.injectString("$auth\r")
+                                                    onDismiss()
+                                                }
+                                            }
                                         },
                                     ) {
                                         Icon(Icons.Default.VpnKey, contentDescription = null, modifier = Modifier.size(16.dp))

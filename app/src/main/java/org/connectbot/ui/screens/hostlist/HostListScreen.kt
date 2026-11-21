@@ -20,6 +20,7 @@ package org.connectbot.ui.screens.hostlist
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -27,13 +28,17 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
@@ -48,7 +53,10 @@ import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -58,14 +66,17 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -82,6 +93,7 @@ import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.colorResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.graphics.toColorInt
@@ -91,6 +103,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.connectbot.R
 import org.connectbot.data.EntityIds
+import org.connectbot.paullm.AiVendor
+import org.connectbot.paullm.AiVendorBadge
+import org.connectbot.paullm.LocalSshDiscoverySheet
 import org.connectbot.paullm.PaullmSecurityDialog
 import org.connectbot.data.JsonImportReader
 import org.connectbot.data.JsonImportTooLargeException
@@ -305,12 +320,26 @@ fun HostListScreenContent(
     var showMenu by remember { mutableStateOf(false) }
     var showDisconnectAllDialog by remember { mutableStateOf(false) }
     var showSecurityDialog by remember { mutableStateOf(false) }
+    var showDiscoverySheet by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
+    val hostListContext = LocalContext.current
 
     if (showSecurityDialog) {
         PaullmSecurityDialog(
             onOpenSettings = onNavigateToSettings,
             onDismiss = { showSecurityDialog = false },
+        )
+    }
+
+    if (showDiscoverySheet) {
+        LocalSshDiscoverySheet(
+            onSelectDiscoveredHost = { name, addr, port ->
+                val clipboard = hostListContext.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("SSH Host", "$addr:$port"))
+                Toast.makeText(hostListContext, "Copied $name ($addr:$port) — paste into Host Editor", Toast.LENGTH_LONG).show()
+                onNavigateToEditHost(null)
+            },
+            onDismiss = { showDiscoverySheet = false },
         )
     }
 
@@ -327,10 +356,40 @@ fun HostListScreenContent(
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
+            val activeHostCount = uiState.connectionStates.values.count { it == ConnectionState.CONNECTED }
             TopAppBar(
-                title = { Text(stringResource(R.string.app_name)) },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        AiVendorBadge(vendor = AiVendor.TMUX, size = 32.dp)
+                        Spacer(Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                stringResource(R.string.app_name),
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Text(
+                                "${uiState.hosts.size} hosts · $activeHostCount connected",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background,
+                ),
                 actions = {
                     if (!makingShortcut) {
+                        IconButton(onClick = { showDiscoverySheet = true }) {
+                            Icon(Icons.Default.Radar, contentDescription = "Discover LAN SSH hosts")
+                        }
+                        IconButton(onClick = onNavigateToPubkeys) {
+                            Icon(Icons.Default.Key, contentDescription = stringResource(R.string.list_menu_pubkeys))
+                        }
+                        IconButton(onClick = { showSecurityDialog = true }) {
+                            Icon(Icons.Default.Lock, contentDescription = "Privacy & Lock")
+                        }
                         IconButton(onClick = { showMenu = true }) {
                             Icon(Icons.Default.MoreVert, contentDescription = stringResource(R.string.button_more_options))
                         }
@@ -570,10 +629,44 @@ private fun HostListItem(
         )
     }
 
-    Column(modifier = modifier) {
+    val isConnected = connectionState == ConnectionState.CONNECTED
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(
+            width = if (isConnected) 1.5.dp else 1.dp,
+            color = if (isConnected) MaterialTheme.colorScheme.tertiary.copy(alpha = 0.7f) else MaterialTheme.colorScheme.outline.copy(alpha = 0.45f),
+        ),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface,
+        ),
+    ) {
         ListItem(
+            colors = ListItemDefaults.colors(containerColor = Color.Transparent),
             supportingContent = {
-                Text("${host.protocol}://${host.hostname}:${host.port}")
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f),
+                    ) {
+                        Text(
+                            text = host.protocol.uppercase(),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+                        )
+                    }
+                    Text(
+                        text = "${host.username.takeIf { it.isNotBlank() }?.let { "$it@" }.orEmpty()}${host.hostname}:${host.port}",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             },
             leadingContent = {
                 Box(
@@ -733,7 +826,6 @@ private fun HostListItem(
                 fontWeight = FontWeight.Bold,
             )
         }
-        HorizontalDivider()
 
         if (showDeleteDialog) {
             HostDeleteDialog(

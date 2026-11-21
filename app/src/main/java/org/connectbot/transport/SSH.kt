@@ -79,6 +79,7 @@ import org.connectbot.sshlib.SessionExit
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeout
+import org.connectbot.paullm.PaullmShell
 import org.connectbot.paullm.SshExecResult
 import org.connectbot.sshlib.SftpClient
 import org.connectbot.sshlib.SftpResult
@@ -952,8 +953,13 @@ open class SSH : AbsTransport {
             }
             session = openedSession
             outputDrained = CompletableDeferred()
+            val tmuxTarget = bridge?.tmuxSessionName?.takeIf { it.isNotBlank() }
+            val tmuxExecCmd = tmuxTarget?.let {
+                PaullmShell.wrapLoginShell("exec tmux attach-session -t ${PaullmShell.quote("=$it")}")
+            }
             val failure = when {
                 !openedSession.requestPty(getEmulation() ?: "xterm", columns, rows, width, height) -> R.string.terminal_pty_rejected
+                tmuxExecCmd != null -> if (openedSession.requestExec(tmuxExecCmd)) null else R.string.terminal_shell_rejected
                 !openedSession.requestShell() -> R.string.terminal_shell_rejected
                 else -> null
             }
@@ -1185,6 +1191,17 @@ open class SSH : AbsTransport {
         jumpFailureReason = DisconnectReason.IO_ERROR
         val currentHost = host ?: return
 
+        val sharedClient = manager?.findAuthenticatedSshClient(currentHost.id, excluding = this)
+        if (sharedClient != null) {
+            client = sharedClient
+            connected = true
+            authenticated = true
+            lastConnectionInfo = sharedClient.connectionInfo
+            updateLocalIpAddress(sharedClient)
+            finishConnection()
+            return
+        }
+
         val jumpHosts = try {
             resolveJumpHostChain(currentHost) { manager?.hostRepository?.findHostByIdBlocking(it) }
         } catch (e: JumpHostChainException) {
@@ -1368,11 +1385,14 @@ open class SSH : AbsTransport {
             }
         }
         closingSession?.close()
-        closingClient?.disconnect()
-        closingJumps.forEach {
-            try {
-                it.disconnect()
-            } catch (ignored: Exception) {
+        val clientStillShared = closingClient != null && manager?.isSshClientStillUsed(closingClient, excluding = this) == true
+        if (!clientStillShared) {
+            closingClient?.disconnect()
+            closingJumps.forEach {
+                try {
+                    it.disconnect()
+                } catch (ignored: Exception) {
+                }
             }
         }
     }
@@ -1845,6 +1865,8 @@ open class SSH : AbsTransport {
     open fun instanceProtocolName(): String = PROTOCOL
 
     override fun supportsRemoteTools(): Boolean = authenticated && client != null
+
+    internal fun activeSshClient(): SshClient? = client?.takeIf { authenticated && connected }
 
     override suspend fun openSftpClient(): SftpResult<SftpClient> = withContext(Dispatchers.IO) {
         val sshClient = client

@@ -59,6 +59,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
+import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Edit
@@ -160,12 +161,18 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.connectbot.R
 import org.connectbot.data.entity.Host
+import org.connectbot.paullm.AiVendor
+import org.connectbot.paullm.AiVendorLogo
+import org.connectbot.paullm.ComposeDraftStore
 import org.connectbot.paullm.PaullmComposeBar
 import org.connectbot.paullm.PaullmShell
+import org.connectbot.paullm.PresetsSheet
 import org.connectbot.paullm.ServerStatsSheet
 import org.connectbot.paullm.SftpBrowserDialog
 import org.connectbot.paullm.TmuxManagerSheet
 import org.connectbot.paullm.TmuxRemoteController
+import org.connectbot.paullm.TmuxSessionInfo
+import org.connectbot.paullm.TmuxSessionTabStrip
 import org.connectbot.paullm.ToolkitSheet
 import org.connectbot.service.AuthBanner
 import org.connectbot.service.DisconnectReason
@@ -826,7 +833,7 @@ fun ConsoleScreen(
     val currentBridge = uiState.bridges
         .getOrNull(uiState.currentBridgeIndex)
     currentBridge?.takeIf { it.transport?.supportsZmodem == true }?.let { key(it) { ZmodemTransferDialog(it) } }
-    val currentBridgeId = currentBridge?.host?.id
+    val currentBridgeId = currentBridge?.sessionUuid
     var fontSizeNotice by remember(currentBridge) { mutableStateOf<FontSizeNoticeState?>(null) }
     val activeProfile by currentBridge?.activeProfile?.collectAsState() ?: remember { mutableStateOf(null) }
     val accessibilityManager = LocalAccessibilityManager.current
@@ -852,6 +859,21 @@ fun ConsoleScreen(
     var showSftpDialog by remember(currentBridgeId) { mutableStateOf(false) }
     var showToolkitSheet by remember(currentBridgeId) { mutableStateOf(false) }
     var showStatsSheet by remember(currentBridgeId) { mutableStateOf(false) }
+    var showPresetsSheet by remember(currentBridgeId) { mutableStateOf(false) }
+    var remoteTmuxSessions by remember(currentBridge?.host?.id) { mutableStateOf<List<TmuxSessionInfo>>(emptyList()) }
+
+    val activeBridgeReadyForTmux = currentBridge?.supportsRemoteTools() == true && currentBridge?.isSessionOpen == true
+    LaunchedEffect(currentBridge?.host?.id, activeBridgeReadyForTmux, uiState.bridges.size) {
+        val bridge = currentBridge ?: return@LaunchedEffect
+        if (bridge.supportsRemoteTools() && bridge.isSessionOpen) {
+            runCatching { TmuxRemoteController.discover(bridge) }
+                .onSuccess { (installed, list) ->
+                    if (installed) {
+                        remoteTmuxSessions = list
+                    }
+                }
+        }
+    }
     val automationState by currentBridge?.automationState?.collectAsState()
         ?: remember { mutableStateOf(org.connectbot.service.automation.AutomationState()) }
 
@@ -881,7 +903,7 @@ fun ConsoleScreen(
     // Check if any modal (menu or dialog) is currently active
     val anyModalActive = showKeyboardSettings || showMenu || showUrlScanDialog || showResizeDialog ||
         showDisconnectDialog || showSessionPickerDialog || showTextInputDialog || showConnectionInfoDialog ||
-        showTmuxSheet || showSftpDialog || showToolkitSheet || showStatsSheet ||
+        showTmuxSheet || showSftpDialog || showToolkitSheet || showStatsSheet || showPresetsSheet ||
         isHardwareKeyPromptActive || currentAuthBanner != null
 
     fun restartTitleBarTimer() {
@@ -1260,6 +1282,30 @@ fun ConsoleScreen(
                 }
 
                 uiState.bridges.isNotEmpty() -> {
+                    val activeBridge = uiState.bridges[uiState.currentBridgeIndex]
+                    TmuxSessionTabStrip(
+                        bridges = uiState.bridges,
+                        currentIndex = uiState.currentBridgeIndex,
+                        remoteTmuxSessions = remoteTmuxSessions,
+                        activeHostId = activeBridge.host.id,
+                        onSelectTab = { index -> selectBridgePreservingKeyboard(index) },
+                        onDetachTab = { target ->
+                            viewModel.detachTab(target)
+                            coroutineScope.launch {
+                                val msg = if (target.tmuxSessionName != null) {
+                                    "Detached from '${target.tmuxSessionName}' (session still running)"
+                                } else {
+                                    "Closed shell tab"
+                                }
+                                snackbarHostState.showSnackbar(msg)
+                            }
+                        },
+                        onAttachRemoteSession = { remoteName ->
+                            viewModel.openOrSwitchTmuxTab(activeBridge.host, remoteName)
+                        },
+                        onOpenTmuxSheet = { showTmuxSheet = true },
+                    )
+
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1278,7 +1324,7 @@ fun ConsoleScreen(
                             Modifier
                         }
 
-                        key(bridge.host.id) {
+                        key(bridge.sessionUuid) {
                             ConsoleTerminalPage(
                                 bridge = bridge,
                                 disconnected = disconnected,
@@ -1357,13 +1403,20 @@ fun ConsoleScreen(
 
                     val activeBridgeForCompose = uiState.bridges[uiState.currentBridgeIndex]
                     if (showComposeBar) {
+                        val composeVendor = AiVendor.detectFromName(
+                            name = activeBridgeForCompose.tmuxSessionName ?: activeBridgeForCompose.host.nickname,
+                            isTmux = activeBridgeForCompose.tmuxSessionName != null,
+                        )
                         PaullmComposeBar(
-                            hostId = activeBridgeForCompose.host.id,
+                            sessionId = activeBridgeForCompose.sessionUuid,
+                            targetLabel = activeBridgeForCompose.displayTitle,
+                            targetVendor = composeVendor,
                             canSend = !disconnected && sessionOpen,
                             onCollapse = {
                                 showComposeBar = false
                                 termFocusRequester.requestFocus()
                             },
+                            onOpenPresets = { showPresetsSheet = true },
                             onSend = { text, mode ->
                                 coroutineScope.launch {
                                     PaullmShell.sendComposeText(activeBridgeForCompose, text, mode)
@@ -1472,8 +1525,25 @@ fun ConsoleScreen(
         }
 
         if (showTmuxSheet && currentBridge != null) {
+            val openTmuxNames = uiState.bridges
+                .filter { it.host.id == currentBridge.host.id }
+                .mapNotNull { it.tmuxSessionName }
+                .toSet()
             TmuxManagerSheet(
                 bridge = currentBridge,
+                openTmuxNames = openTmuxNames,
+                onOpenTmuxTab = { sessionName ->
+                    viewModel.openOrSwitchTmuxTab(currentBridge.host, sessionName)
+                },
+                onOpenNewShellTab = {
+                    viewModel.openNewShellTab(currentBridge.host)
+                },
+                onDetachCurrentTab = {
+                    viewModel.detachTab(currentBridge)
+                },
+                onSessionsRefreshed = { list ->
+                    remoteTmuxSessions = list
+                },
                 onDismiss = {
                     showTmuxSheet = false
                     termFocusRequester.requestFocus()
@@ -1497,6 +1567,9 @@ fun ConsoleScreen(
         if (showToolkitSheet && currentBridge != null) {
             ToolkitSheet(
                 bridge = currentBridge,
+                onOpenTmuxTab = { sessionName ->
+                    viewModel.openOrSwitchTmuxTab(currentBridge.host, sessionName)
+                },
                 onDismiss = {
                     showToolkitSheet = false
                     termFocusRequester.requestFocus()
@@ -1517,18 +1590,57 @@ fun ConsoleScreen(
             )
         }
 
+        if (showPresetsSheet && currentBridge != null) {
+            PresetsSheet(
+                targetLabel = currentBridge.displayTitle,
+                onRunCommand = { cmd ->
+                    currentBridge.injectString("$cmd\r")
+                },
+                onInsertToComposer = { cmd ->
+                    ComposeDraftStore.appendDraft(currentBridge.sessionUuid, cmd, separator = "\n")
+                    showComposeBar = true
+                },
+                onDismiss = {
+                    showPresetsSheet = false
+                    termFocusRequester.requestFocus()
+                },
+            )
+        }
+
         // Overlay TopAppBar - always visible when titleBarHide is false,
         // or temporarily visible when titleBarHide is true and showTitleBar is true
         if (!titleBarHide || showTitleBar) {
             val density = LocalDensity.current
             TopAppBar(
                 title = {
-                    Text(
-                        currentBridge?.host?.nickname
-                            ?: stringResource(R.string.console_default_title),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                    val titleVendor = AiVendor.detectFromName(
+                        name = currentBridge?.tmuxSessionName ?: currentBridge?.host?.nickname,
+                        isTmux = currentBridge?.tmuxSessionName != null,
                     )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (currentBridge != null) {
+                            AiVendorLogo(vendor = titleVendor, size = 18.dp)
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        Column {
+                            Text(
+                                currentBridge?.displayTitle
+                                    ?: stringResource(R.string.console_default_title),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.titleMedium,
+                            )
+                            if (currentBridge?.tmuxSessionName != null) {
+                                Text(
+                                    currentBridge.host.nickname,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
                 },
                 modifier = Modifier
                     .testTag("top_app_bar")
@@ -1676,6 +1788,14 @@ fun ConsoleScreen(
 
                             if (remoteToolsReady) {
                                 DropdownMenuItem(
+                                    text = { Text("Command Presets") },
+                                    onClick = {
+                                        showMenu = false
+                                        showPresetsSheet = true
+                                    },
+                                    leadingIcon = { Icon(Icons.Default.Bookmark, contentDescription = null) },
+                                )
+                                DropdownMenuItem(
                                     text = { Text("AI Vibe Toolkit") },
                                     onClick = {
                                         showMenu = false
@@ -1695,8 +1815,13 @@ fun ConsoleScreen(
                                     text = { Text("Detach tmux Client") },
                                     onClick = {
                                         showMenu = false
-                                        currentBridge?.let {
-                                            TmuxRemoteController.detachCurrentClient(it)
+                                        if (currentBridge.tmuxSessionName != null) {
+                                            viewModel.detachTab(currentBridge)
+                                            coroutineScope.launch {
+                                                snackbarHostState.showSnackbar("Detached client from '${currentBridge.tmuxSessionName}'")
+                                            }
+                                        } else {
+                                            currentBridge.injectString("\u0002d")
                                             coroutineScope.launch {
                                                 snackbarHostState.showSnackbar("Sent client-only detach (Ctrl-B d)")
                                             }

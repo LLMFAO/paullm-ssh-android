@@ -85,7 +85,10 @@ class AppViewModel @Inject constructor(
     val authOnLaunchEnabled: Boolean
         get() = prefs.getBoolean(PreferenceConstants.AUTH_ON_LAUNCH, false)
 
-    private fun currentThemeMode() = ThemeMode.fromString(prefs.getString(PreferenceConstants.THEME_MODE, null))
+    private fun currentThemeMode(): ThemeMode {
+        val saved = prefs.getString(PreferenceConstants.THEME_MODE, null)
+        return if (saved == null) ThemeMode.DARK else ThemeMode.fromString(saved)
+    }
 
     private val _themeMode = MutableStateFlow(currentThemeMode())
     val themeMode: StateFlow<ThemeMode> = _themeMode.asStateFlow()

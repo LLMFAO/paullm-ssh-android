@@ -423,6 +423,13 @@ class TerminalBridge {
     var notificationSessionId: String = java.util.UUID.randomUUID().toString()
         private set
 
+    val sessionUuid: UUID = UUID.randomUUID()
+
+    val tmuxSessionName: String?
+
+    val displayTitle: String
+        get() = tmuxSessionName ?: host.nickname
+
     var disconnected = false
         private set
     var connecting = false
@@ -479,10 +486,16 @@ class TerminalBridge {
      * launch thread to start SSH connection and handle any hostkey verification
      * and password authentication.
      */
-    constructor(manager: TerminalManager, host: Host, dispatchers: CoroutineDispatchers) {
+    constructor(
+        manager: TerminalManager,
+        host: Host,
+        dispatchers: CoroutineDispatchers,
+        tmuxSessionName: String? = null,
+    ) {
         this.manager = manager
         this.host = host
         this.dispatchers = dispatchers
+        this.tmuxSessionName = tmuxSessionName
         scope = CoroutineScope(SupervisorJob() + dispatchers.default)
 
         // Load profile for this host (always returns a profile, defaulting to Default profile)
@@ -1146,7 +1159,9 @@ class TerminalBridge {
                         relayTransport = t
                         relayJob = scope.launch {
                             previousJob?.join()
-                            startAutomation()
+                            if (tmuxSessionName == null) {
+                                startAutomation()
+                            }
                             newRelay.start()
                         }
                     }

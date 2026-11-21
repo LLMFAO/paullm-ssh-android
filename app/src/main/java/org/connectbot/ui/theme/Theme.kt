@@ -92,9 +92,9 @@ private val darkScheme = darkColorScheme(
 
 @Composable
 fun ConnectBotTheme(
-    themeMode: ThemeMode = ThemeMode.SYSTEM,
-    // Dynamic color is available on Android 12+
-    dynamicColor: Boolean = true,
+    themeMode: ThemeMode = ThemeMode.DARK,
+    // Keep the custom paullmSSH dark obsidian/cyan developer palette by default
+    dynamicColor: Boolean = false,
     content: @Composable () -> Unit,
 ) {
     val darkTheme = when (themeMode) {

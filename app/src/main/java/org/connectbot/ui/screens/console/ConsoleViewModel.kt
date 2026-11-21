@@ -32,7 +32,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.connectbot.data.EntityIds
+import org.connectbot.data.entity.Host
 import org.connectbot.di.CoroutineDispatchers
+import org.connectbot.service.DisconnectReason
 import org.connectbot.service.TerminalBridge
 import org.connectbot.service.TerminalManager
 import org.connectbot.sshlib.PortForwarder
@@ -60,7 +62,7 @@ class ConsoleViewModel @Inject constructor(
     private val hostId: UUID = EntityIds.parse(savedStateHandle.get<String>("hostId"))
     private var terminalManager: TerminalManager? = null
     private var pendingInitialHostId: UUID? = hostId.takeIf { it != EntityIds.NONE }
-    private var selectedHostId: UUID? = null
+    private var selectedSessionUuid: UUID? = null
 
     private val progressJobs = mutableMapOf<UUID, Job>()
     private val networkStatusJobs = mutableMapOf<UUID, Job>()
@@ -165,15 +167,15 @@ class ConsoleViewModel @Inject constructor(
         jobs: MutableMap<UUID, Job>,
         createJob: (TerminalBridge) -> Job,
     ) {
-        val activeHostIds = bridges.map { it.host.id }.toSet()
+        val activeSessionIds = bridges.map { it.sessionUuid }.toSet()
 
-        val removedIds = jobs.keys.filter { it !in activeHostIds }
-        removedIds.forEach { hostId ->
-            jobs.remove(hostId)?.cancel()
+        val removedIds = jobs.keys.filter { it !in activeSessionIds }
+        removedIds.forEach { sessionId ->
+            jobs.remove(sessionId)?.cancel()
         }
 
         bridges.forEach { bridge ->
-            jobs.getOrPut(bridge.host.id) {
+            jobs.getOrPut(bridge.sessionUuid) {
                 createJob(bridge)
             }
         }
@@ -200,14 +202,14 @@ class ConsoleViewModel @Inject constructor(
         updateProgressState(progressInfo)
     }
 
-    private fun findBridgeIndex(bridges: List<TerminalBridge>, bridgeHostId: UUID?): Int {
-        if (bridgeHostId == null) {
-            return -1
-        }
+    private fun findBridgeIndexByHost(bridges: List<TerminalBridge>, bridgeHostId: UUID?): Int {
+        if (bridgeHostId == null) return -1
+        return bridges.indexOfFirst { it.host.id == bridgeHostId }
+    }
 
-        return bridges.indexOfFirst { bridge ->
-            bridge.host.id == bridgeHostId
-        }
+    private fun findBridgeIndexBySession(bridges: List<TerminalBridge>, sessionUuid: UUID?): Int {
+        if (sessionUuid == null) return -1
+        return bridges.indexOfFirst { it.sessionUuid == sessionUuid }
     }
 
     private fun stepBridgeSelection(offset: Int) {
@@ -266,8 +268,8 @@ class ConsoleViewModel @Inject constructor(
 
     private fun updateBridges(allBridges: List<TerminalBridge>) {
         val currentState = _uiState.value
-        val selectedIndex = findBridgeIndex(allBridges, selectedHostId)
-        val requestedIndex = findBridgeIndex(allBridges, pendingInitialHostId)
+        val selectedIndex = findBridgeIndexBySession(allBridges, selectedSessionUuid)
+        val requestedIndex = findBridgeIndexByHost(allBridges, pendingInitialHostId)
         val requestedBridgeAvailable = requestedIndex != -1
 
         val newIndex = when {
@@ -279,9 +281,9 @@ class ConsoleViewModel @Inject constructor(
 
         if (requestedBridgeAvailable) {
             pendingInitialHostId = null
-            selectedHostId = allBridges.getOrNull(newIndex)?.host?.id
+            selectedSessionUuid = allBridges.getOrNull(newIndex)?.sessionUuid
         } else if (pendingInitialHostId == null) {
-            selectedHostId = allBridges.getOrNull(newIndex)?.host?.id
+            selectedSessionUuid = allBridges.getOrNull(newIndex)?.sessionUuid
         }
 
         val waitingForRequestedHost = pendingInitialHostId != null
@@ -300,10 +302,50 @@ class ConsoleViewModel @Inject constructor(
 
     fun selectBridge(index: Int) {
         if (index in _uiState.value.bridges.indices) {
-            selectedHostId = _uiState.value.bridges[index].host.id
+            selectedSessionUuid = _uiState.value.bridges[index].sessionUuid
             _uiState.update { it.copy(currentBridgeIndex = index) }
             updateCurrentBridgeProgress()
         }
+    }
+
+    fun openOrSwitchTmuxTab(host: Host, tmuxSessionName: String) {
+        val manager = terminalManager ?: return
+        val bridge = manager.openTmuxSession(host, tmuxSessionName)
+        selectedSessionUuid = bridge.sessionUuid
+        val currentBridges = manager.bridgesFlow.value
+        val idx = currentBridges.indexOfFirst { it.sessionUuid == bridge.sessionUuid }
+        if (idx >= 0) {
+            _uiState.update {
+                it.copy(
+                    bridges = currentBridges,
+                    currentBridgeIndex = idx,
+                    revision = it.revision + 1,
+                )
+            }
+            updateCurrentBridgeProgress(currentBridges, idx)
+        }
+    }
+
+    fun openNewShellTab(host: Host) {
+        val manager = terminalManager ?: return
+        val bridge = manager.openAdditionalShell(host)
+        selectedSessionUuid = bridge.sessionUuid
+        val currentBridges = manager.bridgesFlow.value
+        val idx = currentBridges.indexOfFirst { it.sessionUuid == bridge.sessionUuid }
+        if (idx >= 0) {
+            _uiState.update {
+                it.copy(
+                    bridges = currentBridges,
+                    currentBridgeIndex = idx,
+                    revision = it.revision + 1,
+                )
+            }
+            updateCurrentBridgeProgress(currentBridges, idx)
+        }
+    }
+
+    fun detachTab(bridge: TerminalBridge) {
+        bridge.dispatchDisconnect(DisconnectReason.USER_REQUESTED)
     }
 
     /**

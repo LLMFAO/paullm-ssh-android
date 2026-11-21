@@ -19,10 +19,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardReturn
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -48,6 +50,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -86,24 +90,24 @@ object ComposeDraftStore {
         ),
     )
 
-    fun updateDraft(hostId: UUID, value: String) {
-        _drafts.update { current -> current + (hostId to value) }
+    fun updateDraft(sessionId: UUID, value: String) {
+        _drafts.update { current -> current + (sessionId to value) }
     }
 
-    fun appendDraft(hostId: UUID, addition: String, separator: String = "") {
+    fun appendDraft(sessionId: UUID, addition: String, separator: String = "") {
         _drafts.update { current ->
-            val prev = current[hostId].orEmpty()
+            val prev = current[sessionId].orEmpty()
             val merged = if (prev.isEmpty() || separator.isEmpty() || prev.endsWith(separator) || prev.endsWith("\n")) {
                 prev + addition
             } else {
                 prev + separator + addition
             }
-            current + (hostId to merged)
+            current + (sessionId to merged)
         }
     }
 
-    fun clearDraft(hostId: UUID) {
-        _drafts.update { current -> current - hostId }
+    fun clearDraft(sessionId: UUID) {
+        _drafts.update { current -> current - sessionId }
     }
 
     fun setSendMode(mode: TerminalSendMode) {
@@ -113,9 +117,12 @@ object ComposeDraftStore {
 
 @Composable
 fun PaullmComposeBar(
-    hostId: UUID,
+    sessionId: UUID,
+    targetLabel: String,
+    targetVendor: AiVendor,
     canSend: Boolean,
     onCollapse: () -> Unit,
+    onOpenPresets: () -> Unit,
     onSend: (String, TerminalSendMode) -> Unit,
     onMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -123,7 +130,7 @@ fun PaullmComposeBar(
     val context = LocalContext.current
     val allDrafts by ComposeDraftStore.drafts.collectAsState()
     val sendMode by ComposeDraftStore.sendMode.collectAsState()
-    val draft = allDrafts[hostId].orEmpty()
+    val draft = allDrafts[sessionId].orEmpty()
 
     var showModeMenu by remember { mutableStateOf(false) }
     var showPromptsMenu by remember { mutableStateOf(false) }
@@ -137,7 +144,7 @@ fun PaullmComposeBar(
                 ?.firstOrNull()
                 ?.trim()
             if (!spoken.isNullOrEmpty()) {
-                ComposeDraftStore.appendDraft(hostId, spoken, separator = " ")
+                ComposeDraftStore.appendDraft(sessionId, spoken, separator = " ")
             }
         }
     }
@@ -145,7 +152,7 @@ fun PaullmComposeBar(
     fun startVoiceDictation() {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_PROMPT, "Dictate command or prompt")
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Dictate for $targetLabel")
         }
         val resolved = intent.resolveActivity(context.packageManager)
         if (resolved == null) {
@@ -165,14 +172,15 @@ fun PaullmComposeBar(
             ?.coerceToText(context)
             ?.toString()
         if (!text.isNullOrEmpty()) {
-            ComposeDraftStore.appendDraft(hostId, text)
+            ComposeDraftStore.appendDraft(sessionId, text)
         }
     }
 
     Surface(
         modifier = modifier.fillMaxWidth(),
-        tonalElevation = 4.dp,
-        shadowElevation = 4.dp,
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 6.dp,
+        shadowElevation = 6.dp,
     ) {
         Column(
             modifier = Modifier
@@ -180,14 +188,39 @@ fun PaullmComposeBar(
                 .padding(horizontal = 10.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            HorizontalDivider()
+            HorizontalDivider(color = targetVendor.accent.copy(alpha = 0.35f))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    AiVendorLogo(vendor = targetVendor, size = 14.dp)
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = "Sending to $targetLabel",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Medium,
+                        color = targetVendor.accent,
+                    )
+                }
+                Text(
+                    text = sendMode.title,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
             OutlinedTextField(
                 value = draft,
-                onValueChange = { ComposeDraftStore.updateDraft(hostId, it) },
+                onValueChange = { ComposeDraftStore.updateDraft(sessionId, it) },
                 modifier = Modifier.fillMaxWidth(),
-                placeholder = { Text("Compose command or AI prompt...") },
+                placeholder = { Text("Compose prompt or command for $targetLabel...") },
                 minLines = 1,
                 maxLines = 4,
+                shape = RoundedCornerShape(12.dp),
                 textStyle = MaterialTheme.typography.bodyMedium,
             )
 
@@ -224,6 +257,13 @@ fun PaullmComposeBar(
                         Icon(Icons.Default.ContentPaste, contentDescription = "Paste")
                     }
 
+                    IconButton(
+                        onClick = onOpenPresets,
+                        modifier = Modifier.size(36.dp),
+                    ) {
+                        Icon(Icons.Default.Bookmark, contentDescription = "Command presets")
+                    }
+
                     Box {
                         IconButton(
                             onClick = { showPromptsMenu = true },
@@ -240,7 +280,7 @@ fun PaullmComposeBar(
                                     text = { Text(item.label) },
                                     onClick = {
                                         showPromptsMenu = false
-                                        ComposeDraftStore.appendDraft(hostId, item.content, separator = "\n")
+                                        ComposeDraftStore.appendDraft(sessionId, item.content, separator = "\n")
                                     },
                                 )
                             }
@@ -248,7 +288,7 @@ fun PaullmComposeBar(
                     }
 
                     IconButton(
-                        onClick = { ComposeDraftStore.appendDraft(hostId, "\n") },
+                        onClick = { ComposeDraftStore.appendDraft(sessionId, "\n") },
                         modifier = Modifier.size(36.dp),
                     ) {
                         Icon(Icons.AutoMirrored.Filled.KeyboardReturn, contentDescription = "Insert newline")
@@ -256,7 +296,7 @@ fun PaullmComposeBar(
 
                     if (draft.isNotEmpty()) {
                         IconButton(
-                            onClick = { ComposeDraftStore.clearDraft(hostId) },
+                            onClick = { ComposeDraftStore.clearDraft(sessionId) },
                             modifier = Modifier.size(36.dp),
                         ) {
                             Icon(Icons.Default.Clear, contentDescription = "Clear draft")
@@ -301,7 +341,7 @@ fun PaullmComposeBar(
                         val payload = draft
                         if (payload.isNotBlank() && canSend) {
                             onSend(payload, sendMode)
-                            ComposeDraftStore.clearDraft(hostId)
+                            ComposeDraftStore.clearDraft(sessionId)
                         }
                     },
                     enabled = draft.isNotBlank() && canSend,

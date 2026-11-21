@@ -1,5 +1,6 @@
 package org.connectbot.paullm
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -7,24 +8,29 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.Tab
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -32,7 +38,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -43,6 +51,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
@@ -59,12 +68,16 @@ enum class TmuxLaunchPreset(
     val label: String,
     val defaultName: String,
     val command: String?,
+    val vendor: AiVendor,
 ) {
-    SHELL("Shell", "main", null),
-    CLAUDE("Claude", "claude", "claude"),
-    CODEX("Codex", "codex", "codex"),
-    OPENCODE("OpenCode", "opencode", "opencode"),
-    ANTIGRAVITY("Antigravity", "agy", "agy"),
+    CLAUDE("Claude", "claude", "claude", AiVendor.CLAUDE),
+    CODEX("Codex", "codex", "codex", AiVendor.CODEX),
+    GROK("Grok", "grok", "grok", AiVendor.GROK),
+    OPENCODE("OpenCode", "opencode", "opencode", AiVendor.OPENCODE),
+    ANTIGRAVITY("Antigravity", "agy", "agy", AiVendor.ANTIGRAVITY),
+    AIDER("Aider", "aider", "aider", AiVendor.AIDER),
+    GOOSE("Goose", "goose", "goose", AiVendor.GOOSE),
+    SHELL("Shell", "main", null, AiVendor.TMUX),
 }
 
 object TmuxRemoteController {
@@ -106,28 +119,66 @@ object TmuxRemoteController {
         return true to parsed
     }
 
-    fun attachExact(bridge: TerminalBridge, sessionName: String) {
-        val target = PaullmShell.quote("=$sessionName")
-        bridge.injectString("tmux attach-session -t $target\r")
-    }
-
-    fun createAndAttach(bridge: TerminalBridge, rawName: String, preset: TmuxLaunchPreset) {
+    /**
+     * Creates a detached tmux session out-of-band via SSH exec so nothing is ever typed into another terminal tab.
+     * Returns the sanitized session name ready to attach in its own dedicated PTY tab.
+     */
+    suspend fun createDetachedSession(
+        bridge: TerminalBridge,
+        rawName: String,
+        preset: TmuxLaunchPreset,
+        customCommand: String? = null,
+    ): Result<String> {
         val cleanName = rawName.trim()
             .ifEmpty { preset.defaultName }
             .replace(Regex("[^A-Za-z0-9._-]"), "-")
         val quotedName = PaullmShell.quote(cleanName)
-        val launchCmd = preset.command
-        val full = if (launchCmd != null) {
-            "tmux new-session -A -s $quotedName ${PaullmShell.quote("$launchCmd; exec \${SHELL:-sh}")}"
+        val exactTarget = PaullmShell.quote("=$cleanName")
+        val launchCmd = customCommand?.trim()?.takeIf { it.isNotEmpty() } ?: preset.command
+        val createCmd = if (launchCmd != null) {
+            "tmux new-session -d -s $quotedName ${PaullmShell.quote("$launchCmd; exec \${SHELL:-sh}")}"
         } else {
-            "tmux new-session -A -s $quotedName"
+            "tmux new-session -d -s $quotedName"
         }
-        bridge.injectString("$full\r")
+        val body = "if ! tmux has-session -t $exactTarget 2>/dev/null; then $createCmd; fi && echo __SESSION_OK__"
+        val res = bridge.execCommand(PaullmShell.wrapLoginShell(body), timeoutMs = 10_000L)
+        return if (res.stdout.contains("__SESSION_OK__")) {
+            Result.success(cleanName)
+        } else {
+            Result.failure(IllegalStateException(res.stderr.ifBlank { res.error ?: "Failed to create tmux session" }))
+        }
     }
 
-    fun detachCurrentClient(bridge: TerminalBridge) {
-        // Sends standard tmux prefix + d to detach only this client without touching other clients or killing the session.
-        bridge.injectString("\u0002d")
+    suspend fun renameSession(bridge: TerminalBridge, oldName: String, newRawName: String): Result<String> {
+        val cleanNew = newRawName.trim().replace(Regex("[^A-Za-z0-9._-]"), "-")
+        if (cleanNew.isEmpty()) return Result.failure(IllegalArgumentException("Name cannot be empty"))
+        val body = "tmux rename-session -t ${PaullmShell.quote("=$oldName")} ${PaullmShell.quote(cleanNew)} && echo __OK__"
+        val res = bridge.execCommand(PaullmShell.wrapLoginShell(body), timeoutMs = 8_000L)
+        return if (res.stdout.contains("__OK__")) {
+            Result.success(cleanNew)
+        } else {
+            Result.failure(IllegalStateException(res.stderr.ifBlank { res.error ?: "Rename failed" }))
+        }
+    }
+
+    suspend fun addWindow(bridge: TerminalBridge, sessionName: String): Result<Unit> {
+        val body = "tmux new-window -t ${PaullmShell.quote("=$sessionName")} && echo __OK__"
+        val res = bridge.execCommand(PaullmShell.wrapLoginShell(body), timeoutMs = 8_000L)
+        return if (res.stdout.contains("__OK__")) {
+            Result.success(Unit)
+        } else {
+            Result.failure(IllegalStateException(res.stderr.ifBlank { res.error ?: "Failed to create window" }))
+        }
+    }
+
+    suspend fun killSession(bridge: TerminalBridge, sessionName: String): Result<Unit> {
+        val body = "tmux kill-session -t ${PaullmShell.quote("=$sessionName")} && echo __OK__"
+        val res = bridge.execCommand(PaullmShell.wrapLoginShell(body), timeoutMs = 8_000L)
+        return if (res.stdout.contains("__OK__")) {
+            Result.success(Unit)
+        } else {
+            Result.failure(IllegalStateException(res.stderr.ifBlank { res.error ?: "Kill failed" }))
+        }
     }
 
     fun sendInstallCommand(bridge: TerminalBridge) {
@@ -144,17 +195,27 @@ object TmuxRemoteController {
 @Composable
 fun TmuxManagerSheet(
     bridge: TerminalBridge,
+    openTmuxNames: Set<String>,
+    onOpenTmuxTab: (String) -> Unit,
+    onOpenNewShellTab: () -> Unit,
+    onDetachCurrentTab: () -> Unit,
+    onSessionsRefreshed: (List<TmuxSessionInfo>) -> Unit,
     onDismiss: () -> Unit,
     onMessage: (String) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     var loading by remember { mutableStateOf(true) }
+    var launching by remember { mutableStateOf(false) }
     var tmuxInstalled by remember { mutableStateOf(true) }
     var sessions by remember { mutableStateOf<List<TmuxSessionInfo>>(emptyList()) }
     var errorText by remember { mutableStateOf<String?>(null) }
 
-    var selectedPreset by remember { mutableStateOf(TmuxLaunchPreset.SHELL) }
-    var newSessionName by remember { mutableStateOf(TmuxLaunchPreset.SHELL.defaultName) }
+    var selectedPreset by remember { mutableStateOf(TmuxLaunchPreset.CLAUDE) }
+    var newSessionName by remember { mutableStateOf(TmuxLaunchPreset.CLAUDE.defaultName) }
+    var customCmd by remember { mutableStateOf("") }
+
+    var renameTarget by remember { mutableStateOf<TmuxSessionInfo?>(null) }
+    var killTarget by remember { mutableStateOf<TmuxSessionInfo?>(null) }
 
     fun refresh() {
         scope.launch {
@@ -164,6 +225,7 @@ fun TmuxManagerSheet(
                 .onSuccess { (installed, list) ->
                     tmuxInstalled = installed
                     sessions = list
+                    onSessionsRefreshed(list)
                 }
                 .onFailure { err ->
                     errorText = err.message ?: "Unable to query tmux"
@@ -174,6 +236,63 @@ fun TmuxManagerSheet(
 
     LaunchedEffect(bridge) {
         refresh()
+    }
+
+    renameTarget?.let { target ->
+        var editedName by remember(target) { mutableStateOf(target.name) }
+        AlertDialog(
+            onDismissRequest = { renameTarget = null },
+            title = { Text("Rename tmux session") },
+            text = {
+                OutlinedTextField(
+                    value = editedName,
+                    onValueChange = { editedName = it },
+                    label = { Text("New session name") },
+                    singleLine = true,
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        renameTarget = null
+                        scope.launch {
+                            TmuxRemoteController.renameSession(bridge, target.name, editedName)
+                                .onSuccess {
+                                    onMessage("Renamed '${target.name}' to '$it'")
+                                    refresh()
+                                }
+                                .onFailure { errorText = it.message }
+                        }
+                    },
+                ) { Text("Rename") }
+            },
+            dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("Cancel") } },
+        )
+    }
+
+    killTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { killTarget = null },
+            title = { Text("Kill tmux session '${target.name}'?") },
+            text = { Text("This terminates all processes running inside '${target.name}' on ${bridge.host.nickname}. Use Detach instead if you want to leave it running.") },
+            confirmButton = {
+                Button(
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                    onClick = {
+                        killTarget = null
+                        scope.launch {
+                            TmuxRemoteController.killSession(bridge, target.name)
+                                .onSuccess {
+                                    onMessage("Killed tmux session '${target.name}'")
+                                    refresh()
+                                }
+                                .onFailure { errorText = it.message }
+                        }
+                    },
+                ) { Text("Kill session") }
+            },
+            dismissButton = { TextButton(onClick = { killTarget = null }) { Text("Cancel") } },
+        )
     }
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
@@ -190,25 +309,34 @@ fun TmuxManagerSheet(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Terminal, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("tmux Sessions", style = MaterialTheme.typography.titleLarge)
+                    AiVendorBadge(vendor = AiVendor.TMUX, size = 32.dp)
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text("tmux Sessions", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            bridge.host.nickname,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedButton(
-                        onClick = {
-                            TmuxRemoteController.detachCurrentClient(bridge)
-                            onMessage("Sent client-only detach (Ctrl-B d)")
-                            onDismiss()
-                        },
-                    ) {
-                        Icon(
-                            Icons.AutoMirrored.Filled.ExitToApp,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Text("Detach")
+                    if (bridge.tmuxSessionName != null) {
+                        OutlinedButton(
+                            onClick = {
+                                onDetachCurrentTab()
+                                onMessage("Detached client from '${bridge.tmuxSessionName}'")
+                                onDismiss()
+                            },
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.ExitToApp,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text("Detach")
+                        }
                     }
                     IconButton(onClick = ::refresh, enabled = !loading) {
                         Icon(Icons.Default.Refresh, contentDescription = "Refresh sessions")
@@ -231,9 +359,9 @@ fun TmuxManagerSheet(
                         modifier = Modifier.padding(14.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Text("tmux is not installed on this host", style = MaterialTheme.typography.titleMedium)
+                        Text("tmux is not installed on ${bridge.host.nickname}", style = MaterialTheme.typography.titleMedium)
                         Text(
-                            "Install tmux to keep shells and AI coding sessions running across mobile disconnects.",
+                            "Install tmux to run concurrent Claude, Codex, Grok, OpenCode, and shell sessions that survive disconnects.",
                             style = MaterialTheme.typography.bodySmall,
                         )
                         Button(
@@ -256,62 +384,116 @@ fun TmuxManagerSheet(
 
                 if (sessions.isEmpty()) {
                     Text(
-                        "No active tmux sessions yet. Launch one below.",
-                        style = MaterialTheme.typography.bodyMedium,
+                        "No live tmux sessions on ${bridge.host.nickname}. Launch an AI or Shell session below — each opens in its own dedicated tab.",
+                        style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 } else {
                     LazyColumn(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height((sessions.size.coerceAtMost(4) * 76).dp),
+                            .heightIn(max = 250.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         items(sessions, key = { it.name }) { session ->
+                            val vendor = AiVendor.detectFromName(session.name, isTmux = true)
+                            val isOpenTab = session.name in openTmuxNames
+                            val isCurrent = bridge.tmuxSessionName == session.name
                             Card(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable {
-                                        TmuxRemoteController.attachExact(bridge, session.name)
-                                        onMessage("Attaching to tmux session '${session.name}'")
+                                        onOpenTmuxTab(session.name)
                                         onDismiss()
                                     },
+                                shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(
+                                    width = if (isCurrent) 1.5.dp else 1.dp,
+                                    color = if (isCurrent) vendor.accent else MaterialTheme.colorScheme.outline.copy(alpha = 0.6f),
+                                ),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isCurrent) {
+                                        vendor.badgeBg
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                                    },
+                                ),
                             ) {
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .padding(12.dp),
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
                                     verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween,
                                 ) {
+                                    AiVendorBadge(vendor = vendor, size = 34.dp)
+                                    Spacer(Modifier.width(10.dp))
                                     Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            session.name,
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontFamily = FontFamily.Monospace,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                        session.currentPath?.let { path ->
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                             Text(
-                                                path,
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                session.name,
+                                                style = MaterialTheme.typography.titleMedium,
+                                                fontFamily = FontFamily.Monospace,
+                                                fontWeight = FontWeight.SemiBold,
                                                 maxLines = 1,
                                                 overflow = TextOverflow.Ellipsis,
                                             )
+                                            if (isOpenTab) {
+                                                Surface(
+                                                    shape = RoundedCornerShape(6.dp),
+                                                    color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.2f),
+                                                ) {
+                                                    Text(
+                                                        if (isCurrent) "ACTIVE" else "TAB",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = MaterialTheme.colorScheme.tertiary,
+                                                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                                                    )
+                                                }
+                                            }
                                         }
+                                        Text(
+                                            buildString {
+                                                append("${session.windowCount}w · ${session.attachedCount}c")
+                                                session.currentPath?.let { append(" · $it") }
+                                            },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
                                     }
-                                    Spacer(Modifier.width(8.dp))
-                                    Text(
-                                        "${session.windowCount}w · ${session.attachedCount}c",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        color = if (session.attachedCount > 0) {
-                                            MaterialTheme.colorScheme.primary
-                                        } else {
-                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                    IconButton(
+                                        onClick = {
+                                            scope.launch {
+                                                TmuxRemoteController.addWindow(bridge, session.name)
+                                                    .onSuccess {
+                                                        onMessage("Added window to '${session.name}'")
+                                                        refresh()
+                                                    }
+                                                    .onFailure { errorText = it.message }
+                                            }
                                         },
-                                    )
+                                        modifier = Modifier.size(32.dp),
+                                    ) {
+                                        Icon(Icons.Default.Tab, contentDescription = "New window", modifier = Modifier.size(18.dp))
+                                    }
+                                    IconButton(
+                                        onClick = { renameTarget = session },
+                                        modifier = Modifier.size(32.dp),
+                                    ) {
+                                        Icon(Icons.Default.Edit, contentDescription = "Rename", modifier = Modifier.size(18.dp))
+                                    }
+                                    IconButton(
+                                        onClick = { killTarget = session },
+                                        modifier = Modifier.size(32.dp),
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Delete,
+                                            contentDescription = "Kill session",
+                                            tint = MaterialTheme.colorScheme.error,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -320,23 +502,55 @@ fun TmuxManagerSheet(
 
                 HorizontalDivider()
 
-                Text("New Session", style = MaterialTheme.typography.titleSmall)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Launch AI / Shell Session", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                    TextButton(
+                        onClick = {
+                            onOpenNewShellTab()
+                            onDismiss()
+                        },
+                    ) {
+                        Text("+ Plain Shell Tab")
+                    }
+                }
 
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     TmuxLaunchPreset.entries.forEach { preset ->
-                        FilterChip(
-                            selected = selectedPreset == preset,
+                        val selected = selectedPreset == preset
+                        Surface(
                             onClick = {
                                 selectedPreset = preset
                                 newSessionName = preset.defaultName
                             },
-                            label = { Text(preset.label) },
-                        )
+                            shape = RoundedCornerShape(12.dp),
+                            color = if (selected) preset.vendor.badgeBg else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                            border = BorderStroke(
+                                width = if (selected) 1.5.dp else 1.dp,
+                                color = if (selected) preset.vendor.accent else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
+                            ),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                AiVendorLogo(vendor = preset.vendor, size = 16.dp)
+                                Text(
+                                    preset.label,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -353,15 +567,33 @@ fun TmuxManagerSheet(
                         singleLine = true,
                     )
                     Button(
+                        enabled = !launching,
                         onClick = {
-                            TmuxRemoteController.createAndAttach(bridge, newSessionName, selectedPreset)
-                            onMessage("Launching '${newSessionName.ifBlank { selectedPreset.defaultName }}'")
-                            onDismiss()
+                            launching = true
+                            scope.launch {
+                                TmuxRemoteController.createDetachedSession(
+                                    bridge = bridge,
+                                    rawName = newSessionName,
+                                    preset = selectedPreset,
+                                    customCommand = customCmd,
+                                ).onSuccess { createdName ->
+                                    onOpenTmuxTab(createdName)
+                                    onMessage("Opened '${createdName}' in dedicated tab")
+                                    onDismiss()
+                                }.onFailure { err ->
+                                    errorText = err.message ?: "Failed to start session"
+                                    launching = false
+                                }
+                            }
                         },
                     ) {
-                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Start")
+                        if (launching) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Open Tab")
+                        }
                     }
                 }
             }

@@ -10,17 +10,17 @@ Native Kotlin + Jetpack Compose + Material 3 Android SSH client built on top of 
 
 ## Added paullmSSH Features (`org.connectbot.paullm`)
 1. **Inline Compose & Voice Bar (`ComposeDraftBar.kt`)**:
-   - Docked multiline composer in `ConsoleScreen` with per-host persisted drafts.
+   - Docked multiline composer in `ConsoleScreen` with per-host in-memory drafts. Drafts currently survive tab changes and reconnects, but not process death.
    - Dedicated Android Speech Recognition (`Mic`) button, Paste, Quick AI Prompt Snippets, Insert Newline, Clear.
    - Four send modes matching iOS `paullm-ssh`: **Enter**, **Agent prompt** (bracketed paste + submit delay), **Paste-safe** (bracketed paste only), and **Raw**.
-2. **Live tmux Session Manager & Safe Detach (`TmuxSheet.kt`)**:
+2. **Live tmux Session Manager (`TmuxSheet.kt`)**:
    - Discovers active remote tmux sessions (`name`, window count, attached count, working directory) over an independent SSH `exec` channel.
    - One-tap exact attach (`tmux attach-session -t '=<name>'`, never `-d`).
    - Quick "+ New Session" launcher with AI presets: **Shell**, **Claude**, **Codex**, **OpenCode**, **Antigravity**.
-   - Client-only **Detach** (`Ctrl-B d`) without killing sessions or detaching other clients, plus one-tap tmux installer when missing.
+   - **Detach** sends `Ctrl-B d` to the active terminal. Use only while that terminal is attached to tmux; connection-specific client verification is not yet implemented. Includes one-tap tmux installer when missing.
 3. **Full SFTP Remote File Browser (`SftpBrowserDialog.kt`)**:
    - Powered directly by `cbssh`'s native `SftpClient` over the live SSH session (works transparently over jump hosts and hardware keys).
-   - Browse, parent/home navigation, hidden-file toggle, bounded 256 KiB UTF-8 text preview + copy, SAF upload & download with progress & cancel, share via `FileProvider`, mkdir, rename/move, octal chmod, and confirmed delete.
+   - Browse, parent/home navigation, hidden-file toggle, bounded 256 KiB UTF-8 text preview + copy, SAF upload & download with progress & cancel, share via `FileProvider`, mkdir, rename/move, octal chmod, and confirmed delete. Uploads use remote staging and replacement rollback; download destination cleanup on interruption remains incomplete.
 4. **AI Vibe Toolkit (`ToolkitSheet.kt`)**:
    - Scans the remote host for Claude Code, Codex CLI, OpenCode CLI, Antigravity CLI, Aider, Goose, `AGENTS.md`, and `docs/ai/context.md`.
    - One-tap Launch (in tmux), Install (with confirmation showing exact command), and Auth setup.

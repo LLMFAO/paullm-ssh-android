@@ -102,6 +102,14 @@ private data class RemoteItem(
     val permissions: Int?,
 )
 
+private data class PendingUpload(
+    val uri: Uri,
+    val destination: String,
+    val name: String,
+    val expectedBytes: Long,
+    val existingTarget: SftpAttributes?,
+)
+
 private fun SftpDirectoryEntry.toRemoteItem(parentDir: String): RemoteItem {
     val perms = attrs.permissions
     val fileType = perms?.and(0xF000) ?: 0
@@ -176,6 +184,7 @@ fun SftpBrowserDialog(
     var chmodTarget by remember { mutableStateOf<RemoteItem?>(null) }
     var deleteTarget by remember { mutableStateOf<RemoteItem?>(null) }
     var pendingDownloadTarget by remember { mutableStateOf<RemoteItem?>(null) }
+    var pendingUpload by remember { mutableStateOf<PendingUpload?>(null) }
 
     suspend fun loadDir(client: SftpClient, targetPath: String) {
         loading = true
@@ -229,58 +238,68 @@ fun SftpBrowserDialog(
         }
     }
 
-    val uploadLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument(),
-    ) { uri ->
-        val client = sftpClient ?: return@rememberLauncherForActivityResult
-        if (uri == null) return@rememberLauncherForActivityResult
-        val fileName = queryDisplayName(context, uri).replace('/', '_')
-        val remoteDest = if (currentPath == "/") "/$fileName" else "$currentPath/$fileName"
+    fun startUpload(request: PendingUpload) {
+        val client = sftpClient ?: return
         activeTransferJob = scope.launch {
-            transferTitle = "Uploading $fileName"
+            transferTitle = "Uploading ${request.name}"
             transferProgress = 0f
             errorBanner = null
             try {
-                withContext(Dispatchers.IO) {
-                    val totalBytes = context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L
-                    val openRes = client.open(
-                        remoteDest,
-                        setOf(SftpOpenFlag.WRITE, SftpOpenFlag.CREATE, SftpOpenFlag.TRUNCATE),
-                    )
-                    val handle = when (openRes) {
-                        is SftpResult.Success -> openRes.value
-                        else -> error("Open failed: ${openRes.errorText()}")
-                    }
-                    try {
-                        context.contentResolver.openInputStream(uri)?.use { input ->
-                            val buf = ByteArray(TRANSFER_CHUNK_BYTES)
-                            var offset = 0L
-                            while (true) {
-                                val read = input.read(buf)
-                                if (read <= 0) break
-                                val chunk = if (read == buf.size) buf else buf.copyOf(read)
-                                val wRes = client.write(handle, offset, chunk)
-                                if (wRes !is SftpResult.Success) error("Write failed: ${wRes.errorText()}")
-                                offset += read
-                                if (totalBytes > 0) {
-                                    transferProgress = (offset.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
-                                }
-                            }
-                        } ?: error("Unable to read selected file")
-                    } finally {
-                        client.close(handle)
-                    }
-                }
-                statusBanner = "Uploaded $fileName"
+                val message = uploadSftpFileSafely(
+                    context = context,
+                    client = client,
+                    source = request.uri,
+                    destination = request.destination,
+                    displayName = request.name,
+                    expectedBytes = request.expectedBytes,
+                    expectedTarget = request.existingTarget,
+                    onProgress = { sent ->
+                        if (request.expectedBytes > 0) {
+                            transferProgress = (sent.toFloat() / request.expectedBytes.toFloat()).coerceIn(0f, 1f)
+                        }
+                    },
+                )
+                statusBanner = message
                 loadDir(client, currentPath)
-            } catch (_: CancellationException) {
-                statusBanner = "Upload canceled"
+            } catch (cancelled: CancellationException) {
+                statusBanner = cancelled.message ?: "Upload canceled; the previous remote file is preserved"
             } catch (e: Exception) {
                 errorBanner = e.message ?: "Upload failed"
             } finally {
                 transferTitle = null
                 transferProgress = null
                 activeTransferJob = null
+            }
+        }
+    }
+
+    val uploadLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        val client = sftpClient ?: return@rememberLauncherForActivityResult
+        if (uri == null) return@rememberLauncherForActivityResult
+        val fileName = queryDisplayName(context, uri)
+        if (fileName.isBlank() || fileName == "." || fileName == ".." ||
+            fileName.any { it == '/' || it.isISOControl() }
+        ) {
+            errorBanner = "The selected file has an invalid name"
+            return@rememberLauncherForActivityResult
+        }
+        val remoteDest = if (currentPath == "/") "/$fileName" else "$currentPath/$fileName"
+        scope.launch {
+            try {
+                val size = withContext(Dispatchers.IO) {
+                    context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L
+                }
+                val existing = withContext(Dispatchers.IO) { inspectSftpUploadTarget(client, remoteDest) }
+                val request = PendingUpload(uri, remoteDest, fileName, size, existing)
+                if (existing == null) {
+                    startUpload(request)
+                } else {
+                    pendingUpload = request
+                }
+            } catch (e: Exception) {
+                errorBanner = e.message ?: "Could not prepare upload"
             }
         }
     }
@@ -711,6 +730,27 @@ fun SftpBrowserDialog(
                 )
             }
         }
+    }
+
+    pendingUpload?.let { request ->
+        AlertDialog(
+            onDismissRequest = { pendingUpload = null },
+            title = { Text("Replace ${request.name}?") },
+            text = {
+                Text("The existing remote file will be kept until the new upload completes. If the upload fails, the old file will be restored.")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingUpload = null
+                        startUpload(request)
+                    },
+                ) { Text("Replace") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingUpload = null }) { Text("Cancel") }
+            },
+        )
     }
 
     if (previewBody != null) {
