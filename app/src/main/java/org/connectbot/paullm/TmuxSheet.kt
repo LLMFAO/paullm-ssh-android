@@ -75,6 +75,8 @@ enum class TmuxLaunchPreset(
     GROK("Grok", "grok", "grok", AiVendor.GROK),
     OPENCODE("OpenCode", "opencode", "opencode", AiVendor.OPENCODE),
     ANTIGRAVITY("Antigravity", "agy", "agy", AiVendor.ANTIGRAVITY),
+    GEMINI("Gemini", "gemini", "gemini", AiVendor.GEMINI),
+    PI("Pi", "pi", "pi", AiVendor.PI),
     AIDER("Aider", "aider", "aider", AiVendor.AIDER),
     GOOSE("Goose", "goose", "goose", AiVendor.GOOSE),
     SHELL("Shell", "main", null, AiVendor.TMUX),
@@ -543,7 +545,7 @@ fun TmuxManagerSheet(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
-                                AiVendorLogo(vendor = preset.vendor, size = 16.dp)
+                                AiVendorLogo(vendor = preset.vendor, size = 20.dp)
                                 Text(
                                     preset.label,
                                     style = MaterialTheme.typography.labelMedium,

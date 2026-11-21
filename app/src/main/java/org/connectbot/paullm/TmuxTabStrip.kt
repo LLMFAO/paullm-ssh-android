@@ -104,7 +104,7 @@ fun TmuxSessionTabStrip(
                                 .background(dotColor),
                         )
                         Spacer(Modifier.width(5.dp))
-                        AiVendorLogo(vendor = vendor, size = 14.dp)
+                        AiVendorLogo(vendor = vendor, size = 18.dp)
                         Spacer(Modifier.width(5.dp))
                         Text(
                             text = tabLabel,
@@ -145,7 +145,7 @@ fun TmuxSessionTabStrip(
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        AiVendorLogo(vendor = vendor, size = 13.dp, tint = vendor.accent.copy(alpha = 0.75f))
+                        AiVendorLogo(vendor = vendor, size = 16.dp, tint = vendor.accent.copy(alpha = 0.75f))
                         Spacer(Modifier.width(5.dp))
                         Text(
                             text = remote.name,
