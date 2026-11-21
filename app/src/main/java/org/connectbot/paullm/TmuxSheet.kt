@@ -259,6 +259,35 @@ object TmuxRemoteController {
     }
 }
 
+@Composable
+fun TmuxRenameDialog(
+    currentName: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var editedName by remember(currentName) { mutableStateOf(currentName) }
+    val trimmed = editedName.trim()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Rename tmux session") },
+        text = {
+            OutlinedTextField(
+                value = editedName,
+                onValueChange = { editedName = it },
+                label = { Text("New session name") },
+                singleLine = true,
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = { onConfirm(trimmed) },
+                enabled = trimmed.isNotEmpty() && trimmed != currentName,
+            ) { Text("Rename") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TmuxManagerSheet(
@@ -270,6 +299,7 @@ fun TmuxManagerSheet(
     onSessionsRefreshed: (List<TmuxSessionInfo>) -> Unit,
     onDismiss: () -> Unit,
     onMessage: (String) -> Unit,
+    onSessionRenamed: (String, String) -> Unit = { _, _ -> },
 ) {
     val scope = rememberCoroutineScope()
     var loading by remember { mutableStateOf(true) }
@@ -328,6 +358,7 @@ fun TmuxManagerSheet(
                         scope.launch {
                             TmuxRemoteController.renameSession(bridge, target.name, editedName)
                                 .onSuccess {
+                                    onSessionRenamed(target.name, it)
                                     onMessage("Renamed '${target.name}' to '$it'")
                                     refresh()
                                 }

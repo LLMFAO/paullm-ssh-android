@@ -308,6 +308,15 @@ class ConsoleViewModel @Inject constructor(
         }
     }
 
+    fun renameOpenTmuxTab(host: Host, oldName: String, newName: String) {
+        val manager = terminalManager ?: return
+        manager.renameOpenTmuxSession(host, oldName, newName)
+        val currentBridges = manager.bridgesFlow.value
+        _uiState.update {
+            it.copy(bridges = currentBridges, revision = it.revision + 1)
+        }
+    }
+
     fun openOrSwitchTmuxTab(host: Host, tmuxSessionName: String) {
         val manager = terminalManager ?: return
         val bridge = manager.openTmuxSession(host, tmuxSessionName)

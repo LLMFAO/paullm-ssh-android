@@ -23,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Storage
@@ -267,6 +268,7 @@ fun HostDashboardView(
     onDisconnectHost: () -> Unit,
     onReconnectHost: () -> Unit,
     onMessage: (String) -> Unit,
+    onSessionRenamed: (String, String) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
     val scope = rememberCoroutineScope()
@@ -274,6 +276,7 @@ fun HostDashboardView(
     var loading by remember(bridge.host.id) { mutableStateOf(true) }
     var errorText by remember(bridge.host.id) { mutableStateOf<String?>(null) }
     var actionTarget by remember { mutableStateOf<TmuxSessionInfo?>(null) }
+    var renameTarget by remember { mutableStateOf<TmuxSessionInfo?>(null) }
 
     suspend fun refreshAll() {
         if (disconnected || !bridge.supportsRemoteTools()) {
@@ -304,6 +307,25 @@ fun HostDashboardView(
         } else {
             loading = false
         }
+    }
+
+    renameTarget?.let { target ->
+        TmuxRenameDialog(
+            currentName = target.name,
+            onDismiss = { renameTarget = null },
+            onConfirm = { edited ->
+                renameTarget = null
+                scope.launch {
+                    TmuxRemoteController.renameSession(bridge, target.name, edited)
+                        .onSuccess { created ->
+                            onSessionRenamed(target.name, created)
+                            onMessage("Renamed '${target.name}' to '$created'")
+                            refreshAll()
+                        }
+                        .onFailure { onMessage(it.message ?: "Rename failed") }
+                }
+            },
+        )
     }
 
     actionTarget?.let { target ->
@@ -541,6 +563,22 @@ fun HostDashboardView(
                                         Icon(
                                             Icons.AutoMirrored.Filled.ArrowForward,
                                             contentDescription = "Attach to ${session.name}",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(16.dp),
+                                        )
+                                    }
+                                }
+                                Spacer(Modifier.width(8.dp))
+                                Surface(
+                                    onClick = { renameTarget = session },
+                                    shape = CircleShape,
+                                    color = Color(0xFF1E293B),
+                                    modifier = Modifier.size(30.dp),
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            Icons.Default.Edit,
+                                            contentDescription = "Rename ${session.name}",
                                             tint = Color.White,
                                             modifier = Modifier.size(16.dp),
                                         )

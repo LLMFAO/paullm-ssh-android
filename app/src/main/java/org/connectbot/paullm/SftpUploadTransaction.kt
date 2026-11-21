@@ -4,8 +4,11 @@ package org.connectbot.paullm
 import android.content.Context
 import android.net.Uri
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import org.connectbot.sshlib.SftpAttributes
 import org.connectbot.sshlib.SftpClient
@@ -86,14 +89,42 @@ internal suspend fun uploadSftpFileSafely(
             val input = context.contentResolver.openInputStream(source)
                 ?: throw IOException("Unable to read selected file")
             input.use { stream ->
-                val buffer = ByteArray(32 * 1024)
-                while (true) {
-                    val count = stream.read(buffer)
-                    if (count < 0) break
-                    if (count == 0) continue
-                    requireSuccess(client.write(handle, written, buffer.copyOf(count)), "Write")
-                    written += count
-                    onProgress(written)
+                val chunkSize = 64 * 1024
+                val maxInFlight = 16
+                val buffer = ByteArray(chunkSize)
+                var acked = 0L
+                var lastReported = 0L
+                coroutineScope {
+                    val inFlight = ArrayDeque<Pair<Int, Deferred<SftpResult<Unit>>>>(maxInFlight)
+                    try {
+                        while (true) {
+                            val count = stream.read(buffer)
+                            if (count < 0) break
+                            if (count == 0) continue
+                            val chunk = buffer.copyOf(count)
+                            val offset = written
+                            written += count
+                            inFlight.addLast(count to async { client.write(handle, offset, chunk) })
+                            if (inFlight.size >= maxInFlight) {
+                                val (sz, deferred) = inFlight.removeFirst()
+                                requireSuccess(deferred.await(), "Write")
+                                acked += sz
+                                if (acked - lastReported >= 256 * 1024) {
+                                    lastReported = acked
+                                    onProgress(acked)
+                                }
+                            }
+                        }
+                        while (inFlight.isNotEmpty()) {
+                            val (sz, deferred) = inFlight.removeFirst()
+                            requireSuccess(deferred.await(), "Write")
+                            acked += sz
+                        }
+                        onProgress(acked)
+                    } catch (t: Throwable) {
+                        inFlight.forEach { it.second.cancel() }
+                        throw t
+                    }
                 }
             }
             if (expectedBytes >= 0 && written != expectedBytes) {

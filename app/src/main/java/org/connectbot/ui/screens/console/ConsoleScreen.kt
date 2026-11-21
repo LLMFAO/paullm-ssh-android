@@ -120,6 +120,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isAltPressed
 import androidx.compose.ui.input.key.isCtrlPressed
 import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
@@ -171,10 +172,14 @@ import org.connectbot.paullm.AiVendorLogo
 import org.connectbot.paullm.ChiefOfStaffChatView
 import org.connectbot.paullm.ChiefOfStaffEngine
 import org.connectbot.paullm.ComposeDraftStore
+import org.connectbot.paullm.CosAction
+import org.connectbot.paullm.CosActionType
 import org.connectbot.paullm.CosBackend
 import org.connectbot.paullm.CosBriefingPayload
 import org.connectbot.paullm.CosChatMessage
+import org.connectbot.paullm.CosSessionDecision
 import org.connectbot.paullm.HostDashboardView
+import org.connectbot.paullm.SessionUrgency
 import org.connectbot.paullm.PaullmComposeBar
 import org.connectbot.paullm.PaullmShell
 import org.connectbot.paullm.PresetsSheet
@@ -212,6 +217,8 @@ import org.connectbot.ui.screens.keyboard.ConsoleKeyboardSettings
 import org.connectbot.ui.screens.keyboard.KeyboardWorkflowDialog
 import org.connectbot.ui.theme.terminal
 import org.connectbot.util.PreferenceConstants
+import org.connectbot.util.RemotePath
+import org.connectbot.util.TerminalKeyModifiers
 import org.connectbot.util.UrlUtils
 import org.connectbot.util.rememberTerminalTypefaceResultFromStoredValue
 import org.connectbot.util.terminalTypefaceWithWeight
@@ -914,6 +921,19 @@ fun ConsoleScreen(
     var showComposeBar by rememberSaveable(currentBridgeId) { mutableStateOf(false) }
     var showTmuxSheet by remember(currentBridgeId) { mutableStateOf(false) }
     var showSftpDialog by remember(currentBridgeId) { mutableStateOf(false) }
+    var sftpStartPath by remember { mutableStateOf<String?>(null) }
+    var selectionActive by remember { mutableStateOf(false) }
+    LaunchedEffect(currentBridgeId) {
+        sftpStartPath = null
+        selectionActive = false
+    }
+    LaunchedEffect(selectionController) {
+        while (true) {
+            val active = selectionController?.isSelectionActive == true
+            if (active != selectionActive) selectionActive = active
+            delay(150)
+        }
+    }
     var showToolkitSheet by remember(currentBridgeId) { mutableStateOf(false) }
     var showStatsSheet by remember(currentBridgeId) { mutableStateOf(false) }
     var showPresetsSheet by remember(currentBridgeId) { mutableStateOf(false) }
@@ -924,11 +944,74 @@ fun ConsoleScreen(
     var remoteTmuxSessions by remember(currentBridge?.host?.id) { mutableStateOf<List<TmuxSessionInfo>>(emptyList()) }
     var cosMessages by remember(currentBridge?.host?.id) { mutableStateOf<List<CosChatMessage>>(emptyList()) }
     var cosLatestBriefing by remember(currentBridge?.host?.id) { mutableStateOf<CosBriefingPayload?>(null) }
+    var cosLiveSessionsMap by remember(currentBridge?.host?.id) { mutableStateOf<Map<String, CosSessionDecision>>(emptyMap()) }
     var cosConversationId by remember(currentBridge?.host?.id) { mutableStateOf<String?>(null) }
     var cosBackend by remember(currentBridge?.host?.id) { mutableStateOf(CosBackend.AUTO) }
     var cosRunning by remember(currentBridge?.host?.id) { mutableStateOf(false) }
 
-    fun triggerCosPrompt(bridge: TerminalBridge, promptText: String) {
+    val cosLiveSessionsSorted = remember(cosLiveSessionsMap) {
+        cosLiveSessionsMap.values.sortedWith(compareBy<CosSessionDecision> { it.urgency.rank }.thenBy { it.session.lowercase() })
+    }
+
+    fun applyCosActionsToLiveBoard(actions: List<CosAction>) {
+        if (actions.isEmpty()) return
+        val next = cosLiveSessionsMap.toMutableMap()
+        val knownByName = remoteTmuxSessions.associateBy { it.name.lowercase() }
+        actions.forEach { act ->
+            val key = act.session.trim()
+            if (key.isEmpty()) return@forEach
+            val existingKey = next.keys.firstOrNull { it.equals(key, ignoreCase = true) } ?: key
+            when (act.actionType) {
+                CosActionType.KILL_TMUX -> next.remove(existingKey)
+                CosActionType.START_TMUX -> {
+                    val vendor = AiVendor.detectFromName(act.command.ifBlank { key }, isTmux = true)
+                    next[existingKey] = CosSessionDecision(
+                        session = key,
+                        vendor = vendor,
+                        urgency = SessionUrgency.RUNNING,
+                        summary = "Started: ${act.command.ifBlank { "shell" }}",
+                        decisionNeeded = null,
+                        suggestedActions = emptyList(),
+                    )
+                }
+                CosActionType.SEND -> {
+                    val existing = next[existingKey]
+                    val vendor = existing?.vendor
+                        ?: knownByName[key.lowercase()]?.detectedVendor
+                        ?: AiVendor.detectFromName(key, isTmux = true)
+                    next[existingKey] = CosSessionDecision(
+                        session = existing?.session ?: key,
+                        vendor = vendor,
+                        urgency = SessionUrgency.RUNNING,
+                        summary = "Dispatched: ${act.sendText.replace('\n', ' ').take(90)}",
+                        decisionNeeded = null,
+                        suggestedActions = emptyList(),
+                    )
+                }
+                CosActionType.RENAME_TMUX -> {
+                    val newName = act.newName.ifBlank { act.command }.trim()
+                    if (newName.isEmpty()) return@forEach
+                    val prev = next.remove(existingKey)
+                    next[newName] = CosSessionDecision(
+                        session = newName,
+                        vendor = prev?.vendor
+                            ?: knownByName[key.lowercase()]?.detectedVendor
+                            ?: AiVendor.detectFromName(newName, isTmux = true),
+                        urgency = SessionUrgency.RUNNING,
+                        summary = "Renamed from $key",
+                        decisionNeeded = null,
+                        suggestedActions = emptyList(),
+                    )
+                }
+            }
+        }
+        cosLiveSessionsMap = next
+        cosLatestBriefing = cosLatestBriefing?.copy(
+            sessions = next.values.sortedWith(compareBy<CosSessionDecision> { it.urgency.rank }.thenBy { it.session.lowercase() }),
+        )
+    }
+
+    fun triggerCosPrompt(bridge: TerminalBridge, promptText: String, fullScan: Boolean = false) {
         if (cosRunning || bridge.isDisconnected || !bridge.supportsRemoteTools()) return
         val historySnapshot = cosMessages
         cosMessages = cosMessages + CosChatMessage(isUser = true, text = promptText)
@@ -941,9 +1024,78 @@ fun ConsoleScreen(
                 conversationId = cosConversationId,
                 recentHistory = historySnapshot,
                 knownSessions = remoteTmuxSessions,
+                fullScan = fullScan,
             )
             res.onSuccess { payload ->
-                cosLatestBriefing = payload
+                // Merge returned sessions IN-PLACE into the single Live Status Board
+                val nextMap = if (payload.didFullTmuxScan && payload.sessions.isNotEmpty()) {
+                    payload.sessions.associateBy { it.session }.toMutableMap()
+                } else {
+                    cosLiveSessionsMap.toMutableMap().apply {
+                        payload.sessions.forEach { s ->
+                            val k = keys.firstOrNull { it.equals(s.session, ignoreCase = true) } ?: s.session
+                            put(k, s)
+                        }
+                    }
+                }
+                // Reflect immediate chat-requested executions on the Live Status Board too
+                val knownByName = remoteTmuxSessions.associateBy { it.name.lowercase() }
+                var touchedTmux = false
+                payload.executedReceipts.filter { it.ok }.forEach { rec ->
+                    val existingKey = nextMap.keys.firstOrNull { it.equals(rec.session, ignoreCase = true) } ?: rec.session
+                    when (rec.actionType) {
+                        CosActionType.KILL_TMUX -> {
+                            nextMap.remove(existingKey)
+                            touchedTmux = true
+                        }
+                        CosActionType.START_TMUX -> {
+                            nextMap[existingKey] = CosSessionDecision(
+                                session = rec.session,
+                                vendor = AiVendor.detectFromName(rec.summary.ifBlank { rec.session }, isTmux = true),
+                                urgency = SessionUrgency.RUNNING,
+                                summary = "Started: ${rec.summary}",
+                                decisionNeeded = null,
+                                suggestedActions = emptyList(),
+                            )
+                            touchedTmux = true
+                        }
+                        CosActionType.SEND -> {
+                            val prev = nextMap[existingKey]
+                            nextMap[existingKey] = CosSessionDecision(
+                                session = prev?.session ?: rec.session,
+                                vendor = prev?.vendor
+                                    ?: knownByName[rec.session.lowercase()]?.detectedVendor
+                                    ?: AiVendor.detectFromName(rec.session, isTmux = true),
+                                urgency = SessionUrgency.RUNNING,
+                                summary = "Sent: ${rec.summary}",
+                                decisionNeeded = null,
+                                suggestedActions = emptyList(),
+                            )
+                        }
+                        CosActionType.RENAME_TMUX -> {
+                            val oldName = rec.previousSession?.takeIf { it.isNotBlank() } ?: return@forEach
+                            val newName = rec.session
+                            val oldKey = nextMap.keys.firstOrNull { it.equals(oldName, ignoreCase = true) } ?: oldName
+                            val prev = nextMap.remove(oldKey)
+                            nextMap[newName] = CosSessionDecision(
+                                session = newName,
+                                vendor = prev?.vendor
+                                    ?: knownByName[oldName.lowercase()]?.detectedVendor
+                                    ?: AiVendor.detectFromName(newName, isTmux = true),
+                                urgency = SessionUrgency.RUNNING,
+                                summary = "Renamed from $oldName",
+                                decisionNeeded = null,
+                                suggestedActions = emptyList(),
+                            )
+                            viewModel.renameOpenTmuxTab(bridge.host, oldName, newName)
+                            touchedTmux = true
+                        }
+                    }
+                }
+                cosLiveSessionsMap = nextMap
+                cosLatestBriefing = payload.copy(
+                    sessions = nextMap.values.sortedWith(compareBy<CosSessionDecision> { it.urgency.rank }.thenBy { it.session.lowercase() }),
+                )
                 if (!payload.conversationId.isNullOrBlank()) {
                     cosConversationId = payload.conversationId
                 }
@@ -952,6 +1104,12 @@ fun ConsoleScreen(
                     text = payload.headline,
                     briefing = payload,
                 )
+                if (touchedTmux) {
+                    runCatching { TmuxRemoteController.discover(bridge) }
+                        .onSuccess { (installed, list) ->
+                            if (installed) remoteTmuxSessions = list
+                        }
+                }
             }.onFailure { err ->
                 cosMessages = cosMessages + CosChatMessage(
                     isUser = false,
@@ -1279,7 +1437,21 @@ fun ConsoleScreen(
 
     val urlNotSupportedMessage = stringResource(R.string.console_url_not_supported)
 
+    fun openInSftp(path: String) {
+        val bridge = currentBridge
+        if (bridge == null || bridge.isDisconnected) return
+        sftpStartPath = path
+        showSoftwareKeyboard = false
+        keyboardController?.hide()
+        showSftpDialog = true
+    }
+
     fun openUrl(url: String) {
+        val path = RemotePath.extract(url)
+        if (path != null) {
+            openInSftp(path)
+            return
+        }
         UrlUtils.openUrl(context, url).onFailure { e ->
             coroutineScope.launch {
                 val message = if (e is ActivityNotFoundException) {
@@ -1335,14 +1507,30 @@ fun ConsoleScreen(
             .union(WindowInsets.imeAnimationTarget),
     ) { innerPadding ->
         val handleShortcut: (KeyEvent) -> Boolean = { keyEvent ->
-            handleConsoleShortcut(
-                keyEvent = keyEvent,
-                volumeKeysChangeFontSize = volumeKeysChangeFontSize,
-                copySelection = { selectionController?.copySelection() },
-                pasteClipboardContents = { pasteClipboardContents() },
-                increaseFontSize = { adjustFontSize(increase = true) },
-                decreaseFontSize = { adjustFontSize(increase = false) },
-            )
+            val shiftArrow = keyEvent.type == KeyEventType.KeyDown &&
+                keyEvent.isShiftPressed &&
+                !keyEvent.isCtrlPressed &&
+                !keyEvent.isAltPressed &&
+                (keyEvent.key == Key.DirectionLeft || keyEvent.key == Key.DirectionRight)
+            if (shiftArrow) {
+                val bridge = currentBridge
+                if (bridge != null && !bridge.isDisconnected) {
+                    val target = if (keyEvent.key == Key.DirectionRight) "arrow_right" else "arrow_left"
+                    bridge.sendModifiedKey(target, TerminalKeyModifiers.SHIFT)
+                    true
+                } else {
+                    false
+                }
+            } else {
+                handleConsoleShortcut(
+                    keyEvent = keyEvent,
+                    volumeKeysChangeFontSize = volumeKeysChangeFontSize,
+                    copySelection = { selectionController?.copySelection() },
+                    pasteClipboardContents = { pasteClipboardContents() },
+                    increaseFontSize = { adjustFontSize(increase = true) },
+                    decreaseFontSize = { adjustFontSize(increase = false) },
+                )
+            }
         }
 
         // Terminal content with keyboard overlay
@@ -1412,6 +1600,7 @@ fun ConsoleScreen(
                                 triggerCosPrompt(
                                     activeBridge,
                                     "Give me an executive Chief of Staff briefing combining my canonical vault on delllap and active tmux sessions. Highlight top priorities, open decisions, and blockers.",
+                                    fullScan = true,
                                 )
                             },
                             onAttachTmuxSession = { sessionName ->
@@ -1440,6 +1629,9 @@ fun ConsoleScreen(
                             onMessage = { msg ->
                                 coroutineScope.launch { snackbarHostState.showSnackbar(msg) }
                             },
+                            onSessionRenamed = { oldName, newName ->
+                                viewModel.renameOpenTmuxTab(activeBridge.host, oldName, newName)
+                            },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .weight(1f),
@@ -1449,6 +1641,7 @@ fun ConsoleScreen(
                             bridge = activeBridge,
                             disconnected = disconnected,
                             knownSessions = remoteTmuxSessions,
+                            liveSessions = cosLiveSessionsSorted,
                             messages = cosMessages,
                             selectedBackend = cosBackend,
                             isRunning = cosRunning,
@@ -1458,10 +1651,18 @@ fun ConsoleScreen(
                                     cosConversationId = null
                                 }
                             },
-                            onSendPrompt = { promptText -> triggerCosPrompt(activeBridge, promptText) },
+                            onSendPrompt = { promptText -> triggerCosPrompt(activeBridge, promptText, fullScan = false) },
+                            onRunFullScan = {
+                                triggerCosPrompt(
+                                    activeBridge,
+                                    "Do a full scan of all tmux sessions and combine with my canonical vault on delllap. Highlight top priorities, decisions, and blockers.",
+                                    fullScan = true,
+                                )
+                            },
                             onClearChat = {
                                 cosMessages = emptyList()
                                 cosLatestBriefing = null
+                                cosLiveSessionsMap = emptyMap()
                                 cosConversationId = null
                             },
                             onJumpToSession = { sessionName ->
@@ -1469,6 +1670,10 @@ fun ConsoleScreen(
                                 viewModel.openOrSwitchTmuxTab(activeBridge.host, sessionName)
                             },
                             onOpenUrl = ::openUrl,
+                            onActionsExecuted = { executed -> applyCosActionsToLiveBoard(executed) },
+                            onSessionRenamed = { oldName, newName ->
+                                viewModel.renameOpenTmuxTab(activeBridge.host, oldName, newName)
+                            },
                             onSessionsChanged = {
                                 coroutineScope.launch {
                                     runCatching { TmuxRemoteController.discover(activeBridge) }
@@ -1587,6 +1792,38 @@ fun ConsoleScreen(
                                 modifier = Modifier.fillMaxSize(),
                                 terminalModifier = terminalModifier,
                             )
+                        }
+                        if (selectionActive && !showSftpDialog) {
+                            Surface(
+                                onClick = {
+                                    val controller = selectionController ?: return@Surface
+                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    val previousClip = clipboard.primaryClip
+                                    val selected = controller.copySelection()
+                                    if (previousClip != null) {
+                                        runCatching { clipboard.setPrimaryClip(previousClip) }
+                                    }
+                                    val path = RemotePath.extract(selected)
+                                    if (path == null) {
+                                        coroutineScope.launch {
+                                            snackbarHostState.showSnackbar("Selection has no remote path")
+                                        }
+                                    } else {
+                                        openInSftp(path)
+                                    }
+                                },
+                                modifier = Modifier
+                                    .align(Alignment.TopCenter)
+                                    .padding(top = 8.dp),
+                                shape = RoundedCornerShape(16.dp),
+                                color = MaterialTheme.colorScheme.secondaryContainer,
+                            ) {
+                                Text(
+                                    "Open in SFTP",
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                                    style = MaterialTheme.typography.labelLarge,
+                                )
+                            }
                         }
                         fontSizeNotice?.let { notice ->
                             val dimensions by bridge.terminalDimensions.collectAsState()
@@ -1769,14 +2006,19 @@ fun ConsoleScreen(
                 onMessage = { msg ->
                     coroutineScope.launch { snackbarHostState.showSnackbar(msg) }
                 },
+                onSessionRenamed = { oldName, newName ->
+                    viewModel.renameOpenTmuxTab(currentBridge.host, oldName, newName)
+                },
             )
         }
 
         if (showSftpDialog && currentBridge != null) {
             SftpBrowserDialog(
                 bridge = currentBridge,
+                startPath = sftpStartPath,
                 onDismiss = {
                     showSftpDialog = false
+                    sftpStartPath = null
                     termFocusRequester.requestFocus()
                 },
             )
@@ -1935,6 +2177,7 @@ fun ConsoleScreen(
                                 }
                                 Surface(
                                     onClick = {
+                                        sftpStartPath = null
                                         showSoftwareKeyboard = false
                                         keyboardController?.hide()
                                         showSftpDialog = true
@@ -2191,7 +2434,7 @@ fun ConsoleScreen(
                                 onClick = {
                                     showMenu = false
                                     currentBridge?.let { bridge ->
-                                        scannedUrls = bridge.scanForURLs()
+                                        scannedUrls = (bridge.scanForURLs() + bridge.scanForPaths()).distinct()
                                         showUrlScanDialog = true
                                     }
                                 },

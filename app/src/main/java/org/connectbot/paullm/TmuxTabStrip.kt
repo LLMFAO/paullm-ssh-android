@@ -70,17 +70,14 @@ fun TmuxSessionTabStrip(
         ) {
             bridges.forEachIndexed { index, bridge ->
                 val isSelected = index == currentIndex
-                val isTmux = bridge.tmuxSessionName != null
-                val vendor = bridge.tmuxSessionName?.let { vendorBySessionName[it] }
+                val sessionName = bridge.tmuxSessionName
+                val isTmux = sessionName != null
+                val vendor = sessionName?.let { vendorBySessionName[it] }
                     ?: AiVendor.detectFromName(
-                        name = bridge.tmuxSessionName ?: bridge.host.nickname,
+                        name = sessionName ?: bridge.host.nickname,
                         isTmux = isTmux,
                     )
-                val tabLabel = if (bridge.tmuxSessionName != null) {
-                    bridge.tmuxSessionName
-                } else {
-                    "${bridge.host.nickname} (sh)"
-                }
+                val tabLabel = sessionName ?: "${bridge.host.nickname} (sh)"
                 val dotColor = when {
                     bridge.isDisconnected -> MaterialTheme.colorScheme.error
                     bridge.isConnecting -> Color(0xFFFBBF24)

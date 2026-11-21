@@ -17,13 +17,26 @@
 
 package org.connectbot.ui.components
 
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.dp
 import org.connectbot.data.keyboard.KeyboardDefaults
 import org.connectbot.data.keyboard.KeyboardLayout
 import org.connectbot.service.TerminalBridge
 import org.connectbot.ui.theme.ConnectBotTheme
+import org.connectbot.util.TerminalKeyModifiers
 
 /** Configured terminal input surface. Its parent owns visibility and the auto-hide timer. */
 @Composable
@@ -43,14 +56,45 @@ fun TerminalKeyboard(
     onToggleComposeMode: () -> Unit = {},
     onShortcutModifierChange: () -> Unit = {},
 ) {
-    ConfigurableTerminalKeyboard(
-        bridge = bridge, onInteraction = onInteraction, modifier = modifier,
-        onHideIme = onHideIme, onShowIme = onShowIme, onOpenTextInput = onOpenTextInput, onPasteRequest = onPasteRequest,
-        onScrollInProgressChange = onScrollInProgressChange, imeVisible = imeVisible,
-        playAnimation = playAnimation, showImeToggleKey = showImeToggleKey,
-        isComposeModeActive = isComposeModeActive, onToggleComposeMode = onToggleComposeMode,
-        onShortcutModifierChange = onShortcutModifierChange,
-    )
+    Column(modifier = modifier) {
+        ShiftArrowKeys(bridge = bridge, onInteraction = onInteraction)
+        ConfigurableTerminalKeyboard(
+            bridge = bridge, onInteraction = onInteraction,
+            onHideIme = onHideIme, onShowIme = onShowIme, onOpenTextInput = onOpenTextInput, onPasteRequest = onPasteRequest,
+            onScrollInProgressChange = onScrollInProgressChange, imeVisible = imeVisible,
+            playAnimation = playAnimation, showImeToggleKey = showImeToggleKey,
+            isComposeModeActive = isComposeModeActive, onToggleComposeMode = onToggleComposeMode,
+            onShortcutModifierChange = onShortcutModifierChange,
+        )
+    }
+}
+
+@Composable
+private fun ShiftArrowKeys(bridge: TerminalBridge, onInteraction: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        listOf("arrow_left" to "⇧←", "arrow_right" to "⇧→").forEach { (target, label) ->
+            Surface(
+                onClick = {
+                    onInteraction()
+                    bridge.sendModifiedKey(target, TerminalKeyModifiers.SHIFT)
+                    bridge.tryKeyVibrate()
+                },
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.secondaryContainer,
+            ) {
+                Text(
+                    text = label,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                    style = MaterialTheme.typography.labelLarge,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        }
+    }
 }
 
 @Preview

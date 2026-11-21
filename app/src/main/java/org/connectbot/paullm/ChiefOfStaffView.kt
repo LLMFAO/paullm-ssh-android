@@ -13,6 +13,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -23,6 +24,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -34,6 +36,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -42,7 +45,10 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
@@ -65,6 +71,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -120,12 +127,14 @@ enum class CosActionType(val wireName: String) {
     SEND("SEND"),
     START_TMUX("START_TMUX"),
     KILL_TMUX("KILL_TMUX"),
+    RENAME_TMUX("RENAME_TMUX"),
     ;
 
     companion object {
         fun parse(raw: String?): CosActionType = when (raw?.trim()?.uppercase()) {
             "START_TMUX", "START" -> START_TMUX
             "KILL_TMUX", "KILL", "END_TMUX", "END" -> KILL_TMUX
+            "RENAME_TMUX", "RENAME" -> RENAME_TMUX
             else -> SEND
         }
     }
@@ -139,6 +148,7 @@ data class CosAction(
     val sendText: String = "",
     val command: String = "",
     val cwd: String = "",
+    val newName: String = "",
     val risky: Boolean = false,
 ) {
     val requiresPermissionDialog: Boolean
@@ -169,19 +179,90 @@ data class CosVaultRef(
     val relevance: String = "",
 )
 
+data class CosExecutedReceipt(
+    val actionType: CosActionType,
+    val session: String,
+    val summary: String,
+    val ok: Boolean = true,
+    val error: String? = null,
+    val previousSession: String? = null,
+)
+
+data class CosLearnedNote(
+    val file: String,
+    val summary: String,
+)
+
 data class CosBriefingPayload(
     val headline: String,
     val reply: String,
     val sessions: List<CosSessionDecision>,
     val orchestratorActions: List<CosAction>,
+    val executedReceipts: List<CosExecutedReceipt> = emptyList(),
+    val learnedNotes: List<CosLearnedNote> = emptyList(),
     val vaultRefs: List<CosVaultRef> = emptyList(),
     val backendUsed: String,
     val modelUsed: String,
     val conversationId: String?,
     val scannedCount: Int,
+    val didFullTmuxScan: Boolean = false,
     val vaultNotesChecked: Int = 0,
     val generatedAtMs: Long = System.currentTimeMillis(),
 ) {
+    /**
+     * Unified, deduplicated action plan for this turn:
+     * merges multiple SEND actions targeting the SAME tmux session into ONE consolidated prompt
+     * so Paul never has to tap 5 separate buttons when giving multi-step instructions.
+     */
+    val actionPlan: List<CosAction> by lazy {
+        val raw = buildList {
+            addAll(orchestratorActions)
+            sessions.forEach { addAll(it.suggestedActions) }
+        }
+        if (raw.isEmpty()) return@lazy emptyList()
+
+        val sendGroups = LinkedHashMap<String, MutableList<CosAction>>()
+        val lifecycle = mutableListOf<CosAction>()
+        val seenLifecycle = mutableSetOf<String>()
+
+        raw.forEach { act ->
+            when (act.actionType) {
+                CosActionType.SEND -> {
+                    val key = act.session.trim().lowercase()
+                    val group = sendGroups.getOrPut(key) { mutableListOf() }
+                    if (group.none { it.sendText.trim().equals(act.sendText.trim(), ignoreCase = true) }) {
+                        group.add(act)
+                    }
+                }
+
+                CosActionType.START_TMUX, CosActionType.KILL_TMUX, CosActionType.RENAME_TMUX -> {
+                    val sig = "${act.actionType.wireName}:${act.session.trim().lowercase()}:${act.newName.trim().lowercase()}:${act.command.trim()}"
+                    if (seenLifecycle.add(sig)) {
+                        lifecycle.add(act)
+                    }
+                }
+            }
+        }
+
+        val mergedSends = sendGroups.values.map { list ->
+            if (list.size == 1) {
+                list.first()
+            } else {
+                val first = list.first()
+                val combinedText = list.joinToString("\n") { it.sendText.trim() }
+                CosAction(
+                    id = first.id,
+                    actionType = CosActionType.SEND,
+                    label = "Send to ${first.session} (${list.size} steps)",
+                    session = first.session,
+                    sendText = combinedText,
+                    risky = list.any { it.risky || CosAction.looksRiskyText(it.sendText) },
+                )
+            }
+        }
+        mergedSends + lifecycle
+    }
+
     val decisionCount: Int
         get() = sessions.count { it.urgency == SessionUrgency.NEEDS_DECISION }
     val blockedCount: Int
@@ -203,40 +284,53 @@ data class CosChatMessage(
 
 object ChiefOfStaffEngine {
     const val REMOTE_AGENTS_PATH = "~/.config/paullm-cos/AGENTS.md"
+    const val REMOTE_MEMORY_PATH = "~/.config/paullm-cos/MEMORY.md"
+
+    val DEFAULT_MEMORY_MD = """
+        # Chief of Staff Working Memory — MEMORY.md
+
+        Persistent notes, preferences, project specifics, and recent decisions learned from Paul's interactions and canonical vault on `delllap`.
+
+        ## Paul's Preferences
+        - Act like a sharp conversational Chief of Staff—natural, concise, big-picture first (not `tmux`-myopic).
+        - Execute explicit chat requests immediately without nagging for extra approval; reserve approval cards for proactive suggestions only.
+        - Consolidate multiple instructions for the same `tmux` session into one clear prompt.
+        - Only do full `tmux` scans when asked (or via Brief Now); keep regular chat fast and focused.
+
+        ## Active Projects & Notes
+        - (Updated automatically from interactions and `delllap:/home/paul/ObsidianVault_Final`.)
+    """.trimIndent()
 
     val DEFAULT_AGENTS_MD = """
         # Chief of Staff Orchestrator — AGENTS.md
 
-        You are Paul's executive Chief of Staff & strategic orchestrator. You help Paul make high-leverage decisions across ALL of his projects, notes, priorities, and active engineering work—NOT just what happens to be open in `tmux`.
+        You are Paul's executive Chief of Staff & strategic assistant. You help Paul think, prioritize, learn across projects, and act cleanly across his Obsidian vault on `delllap` and his live `tmux` sessions—like a real human chief of staff in a chat thread.
 
-        ## Big-Picture Mindset (Avoid tmux Myopia)
-        - **Lead with Paul's actual question and strategic context.** Active `tmux` sessions are ONE live execution signal—not the whole picture.
-        - Ground your recommendations in Paul's canonical Obsidian vault on `delllap` (`/home/paul/ObsidianVault_Final`: project roadmaps, goals, open decisions, recent agent updates, architecture docs, runbooks) as well as live `tmux` / host state.
-        - **Only include `sessions` cards that are relevant**:
-          - On an explicit full briefing ("Brief me on all tmux sessions" / "Brief Now"), summarize all live `tmux` sessions sorted by urgency (`NEEDS_DECISION`, `BLOCKED`, `WAITING_INPUT`, `RUNNING`, `DONE`, `IDLE`) AND highlight relevant vault context/priorities.
-          - On a broader strategic, vault, priority, or single-project question, answer the big-picture question thoroughly in `reply` using vault + subagent research, and include ONLY relevant `tmux` sessions in `sessions` (or `[]` if `tmux` isn't relevant to the question).
+        ## Big-Picture & Conversational Agent Style
+        - **Act like an intelligent chat agent**, not a rigid dashboard generator.
+        - Lead directly with Paul's question, strategic context, and vault knowledge. Active `tmux` sessions are ONE execution signal, not the whole world.
+        - Write `reply` in crisp, natural prose/bullets (never dump raw JSON inside `reply`).
+        - Only populate `sessions` when a full scan was requested (`full_scan: true`) OR when specific sessions were inspected/updated for Paul's question.
+
+        ## Direct Execution vs Proactive Suggestions (CRITICAL)
+        - **`execute_now` (NO extra approval prompt!)**: Whenever Paul explicitly tells you in chat to send a command/message to a `tmux` session, start a new `tmux` session, end an existing `tmux` session, or rename a `tmux` session, put it in `execute_now`—the runner will **immediately execute it right now** and report a receipt!
+          - **Rename**: use `action_type: "RENAME_TMUX"`, `session` = the current name, and `new_name` = the requested name. Do not send a shell `tmux rename-session` command.
+          - **Consolidate per session**: If Paul gives 2–4 instructions for the SAME `tmux` session, ALWAYS merge them into **ONE single `SEND`** in `execute_now` with a clean, numbered/structured prompt!
+          - For `START_TMUX`, use verified YOLO flags when appropriate (`codex --dangerously-bypass-approvals-and-sandbox`, `agy --dangerously-skip-permissions`, `opencode --auto`, `claude --dangerously-skip-permissions`, `grok --always-approve`).
+        - **`orchestrator_actions` (ONLY for proactive suggestions!)**: Put items here ONLY when YOU are proactively suggesting something Paul did NOT explicitly ask to run yet. Never force Paul to re-approve something he just told you to do!
+
+        ## Persistent Learning & Assistant Notebook (`MEMORY.md` / `AGENTS.md` / `notes/*.md`)
+        - You maintain durable assistant memory inside `~/.config/paullm-cos/`:
+          - `MEMORY.md`: ongoing project specifics, Paul's preferences, open decisions, key vault takeaways, commitments.
+          - `AGENTS.md`: operating instructions and workflow preferences Paul teaches you.
+          - `notes/<project>.md`: dedicated per-project briefs (e.g. `notes/open-roi.md`, `notes/pocket-gate.md`).
+        - Whenever Paul shares a preference, corrects your behavior, makes a key decision, or surfaces durable project facts from chat or `delllap` vault notes, emit concise `memory_updates` (`mode: "append"` or `"replace"`) so you get smarter every conversation!
 
         ## Canonical Vault Access (`delllap`) & Subagent Delegation
-        - Paul's canonical personal Obsidian vault lives on SSH host `delllap` at `/home/paul/ObsidianVault_Final`.
-        - Never use stale local mirrors, and never touch `ubuntu-server`'s `/home/paul/commure-athelas-vault`.
-        - Pre-loaded `VAULT CONTEXT` (recent notes + matched excerpts from `delllap`) is included with every turn for fast orientation.
-        - **Spin up subagents for deeper research**: Whenever Paul asks about project plans, priorities, specs, past decisions, runbooks, cross-project tradeoffs, or topics not fully covered by the pre-loaded excerpts, spin up read-only subagents (`invoke_subagent`) to search/read `delllap:/home/paul/ObsidianVault_Final` (via `ssh -o BatchMode=yes delllap ...`) in parallel, then synthesize a crisp executive answer.
-        - **Never edit or delete vault notes** unless Paul explicitly requests a vault write.
-        - Whenever you rely on vault notes, cite them in `vault_refs` using the exact Perlite URL format:
+        - Canonical personal Obsidian vault: `delllap:/home/paul/ObsidianVault_Final` (never stale local mirrors; never `ubuntu-server`'s `/home/paul/commure-athelas-vault`).
+        - Spin up read-only subagents (`invoke_subagent`) to search/read `delllap:/home/paul/ObsidianVault_Final` via `ssh -o BatchMode=yes delllap ...` in parallel whenever deeper project specs, history, or runbooks are needed.
+        - Never edit/delete vault notes unless Paul explicitly asks. Cite relied-upon notes in `vault_refs` with exact Perlite URLs:
           `https://delllap.tailfaa66b.ts.net/wiki/?link=/<path-without-.md>`
-
-        ## Orchestrator Permissions (CRITICAL)
-        - **NEVER** start or kill `tmux` sessions directly inside tool calls.
-        - When Paul asks to start a new session or end/clean up an existing session—or when a session is clearly done/stuck and should be ended—propose a typed action in `suggested_actions` or `orchestrator_actions`:
-          - `START_TMUX`: specify `session`, `command` (use verified YOLO flags when appropriate: `codex --dangerously-bypass-approvals-and-sandbox`, `agy --dangerously-skip-permissions`, `opencode --auto`, `claude --dangerously-skip-permissions`, `grok --always-approve`), optional `cwd`, and `"risky": true`.
-          - `KILL_TMUX`: specify `session` and `"risky": true`.
-          - `SEND`: specify `session`, `send` (exact text to type + Enter), and set `"risky": true` if it deletes files, force-pushes, deploys, publishes, uses `sudo`, resets git, or makes irreversible changes.
-        - Paul will approve permission-gated actions with one tap in the Android Chat UI.
-
-        ## Style & Truthfulness
-        - Be concise, sharp, strategic, and executive. Zero fluff.
-        - Cite real vault notes, open decisions, and live session evidence—never invent facts or hide failures.
-        - Write `reply` in clean human-readable prose/bullets (never dump raw JSON inside `reply`).
     """.trimIndent()
 
     private val PYTHON_RUNNER = """
@@ -263,12 +357,13 @@ SCHEMA = {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "action_type": {"type": "string", "enum": ["SEND", "START_TMUX", "KILL_TMUX"]},
+                                "action_type": {"type": "string", "enum": ["SEND", "START_TMUX", "KILL_TMUX", "RENAME_TMUX"]},
                                 "label": {"type": "string"},
                                 "session": {"type": "string"},
                                 "send": {"type": "string"},
                                 "command": {"type": "string"},
                                 "cwd": {"type": "string"},
+                                "new_name": {"type": "string"},
                                 "risky": {"type": "boolean"}
                             },
                             "required": ["action_type", "label", "risky"]
@@ -278,20 +373,50 @@ SCHEMA = {
                 "required": ["session", "status", "summary", "suggested_actions"]
             }
         },
-        "orchestrator_actions": {
+        "execute_now": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "action_type": {"type": "string", "enum": ["SEND", "START_TMUX", "KILL_TMUX"]},
+                    "action_type": {"type": "string", "enum": ["SEND", "START_TMUX", "KILL_TMUX", "RENAME_TMUX"]},
                     "label": {"type": "string"},
                     "session": {"type": "string"},
                     "send": {"type": "string"},
                     "command": {"type": "string"},
                     "cwd": {"type": "string"},
+                    "new_name": {"type": "string"}
+                },
+                "required": ["action_type", "session"]
+            }
+        },
+        "orchestrator_actions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "action_type": {"type": "string", "enum": ["SEND", "START_TMUX", "KILL_TMUX", "RENAME_TMUX"]},
+                    "label": {"type": "string"},
+                    "session": {"type": "string"},
+                    "send": {"type": "string"},
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string"},
+                    "new_name": {"type": "string"},
                     "risky": {"type": "boolean"}
                 },
                 "required": ["action_type", "label", "session", "risky"]
+            }
+        },
+        "memory_updates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["append", "replace"]},
+                    "summary": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["file", "mode", "summary", "content"]
             }
         },
         "vault_refs": {
@@ -335,7 +460,7 @@ def extract_json(text):
         return json.loads(text[start:end + 1])
     raise ValueError("Could not parse JSON from model output: " + text[:240])
 
-def capture_tmux():
+def capture_tmux(full_scan=False, user_msg=""):
     panes_out = run_cmd([
         "tmux", "list-panes", "-a", "-F",
         "#{session_name}\t#{pane_id}\t#{pane_current_command}\t#{pane_pid}\t#{pane_current_path}\t#{pane_title}\t#{session_attached}\t#{session_windows}"
@@ -347,6 +472,7 @@ def capture_tmux():
         if len(parts) == 2:
             children.setdefault(parts[0], []).append(parts[1][:180])
 
+    low_msg = (user_msg or "").lower()
     snap = []
     seen = set()
     for line in panes_out.splitlines():
@@ -358,26 +484,181 @@ def capture_tmux():
         title = p[5] if len(p) > 5 else ""
         attached = p[6] if len(p) > 6 else "0"
         windows = p[7] if len(p) > 7 else "1"
-        raw = run_cmd(["tmux", "capture-pane", "-t", pane_id, "-p", "-J", "-S", "-80"])
-        clean_lines = [ANSI_RE.sub("", l).rstrip() for l in raw.splitlines()]
-        clean_lines = [l for l in clean_lines if l.strip()]
-        tail = "\n".join(clean_lines[-50:])[-2400:]
+
+        # Only capture full scrollback on explicit full_scan OR when this specific session is named in user_msg!
+        should_capture_pane = full_scan or (len(name) >= 2 and name.lower() in low_msg)
+        tail = ""
         branch = ""
-        if cwd and os.path.isdir(cwd):
-            branch = run_cmd(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], timeout=2).strip()
-        snap.append({
+        if should_capture_pane:
+            raw = run_cmd(["tmux", "capture-pane", "-t", pane_id, "-p", "-J", "-S", "-80"])
+            clean_lines = [ANSI_RE.sub("", l).rstrip() for l in raw.splitlines()]
+            clean_lines = [l for l in clean_lines if l.strip()]
+            tail = "\n".join(clean_lines[-50:])[-2400:]
+            if cwd and os.path.isdir(cwd):
+                branch = run_cmd(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], timeout=2).strip()
+        entry = {
             "session": name,
             "pane_id": pane_id,
             "cmd": cmd,
             "child_cmds": children.get(pid, [])[:3],
             "cwd": cwd,
-            "git_branch": branch,
             "title": title,
             "attached": attached,
             "windows": windows,
-            "recent_output": tail,
-        })
+        }
+        if branch:
+            entry["git_branch"] = branch
+        if tail:
+            entry["recent_output"] = tail
+        snap.append(entry)
     return snap
+
+def send_to_tmux_pane(session_name, text):
+    target = f"={session_name}:"
+    p = subprocess.run(["tmux", "display-message", "-p", "-t", target, "#{pane_id}\t#{pane_in_mode}"], capture_output=True, text=True, timeout=5)
+    if p.returncode != 0 or not p.stdout.strip():
+        raise RuntimeError(f"tmux session '{session_name}' not found")
+    parts = p.stdout.strip().split("\t")
+    pane_id = parts[0]
+    in_mode = parts[1] if len(parts) > 1 else "0"
+    if in_mode == "1":
+        subprocess.run(["tmux", "send-keys", "-t", pane_id, "-X", "cancel"], capture_output=True, timeout=5)
+        time.sleep(0.12)
+    clean = (text or "").replace("\r\n", "\n").strip("\n")
+    if not clean:
+        raise RuntimeError("Empty text to send")
+    if "\n" in clean:
+        buf_name = f"cos_{int(time.time() * 1000)}"
+        subprocess.run(["tmux", "load-buffer", "-b", buf_name, "-"], input=clean, text=True, check=True, timeout=5)
+        subprocess.run(["tmux", "paste-buffer", "-p", "-d", "-b", buf_name, "-t", pane_id], check=True, timeout=5)
+    else:
+        subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", "--", clean], check=True, timeout=5)
+    time.sleep(0.30)
+    subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-m"], check=True, timeout=5)
+    return pane_id
+
+def execute_requested_actions(raw_actions):
+    if not isinstance(raw_actions, list) or not raw_actions:
+        return []
+    # Consolidate multiple SEND actions targeting the same session into ONE prompt
+    send_groups = {}
+    send_order = []
+    lifecycle = []
+    for a in raw_actions:
+        if not isinstance(a, dict):
+            continue
+        atype = str(a.get("action_type", "SEND")).upper().strip()
+        sess = str(a.get("session", "")).strip()
+        if not sess:
+            continue
+        if atype == "SEND":
+            txt = str(a.get("send", "")).strip()
+            if not txt:
+                continue
+            key = sess.lower()
+            if key not in send_groups:
+                send_groups[key] = {"session": sess, "texts": [], "labels": []}
+                send_order.append(key)
+            if txt not in send_groups[key]["texts"]:
+                send_groups[key]["texts"].append(txt)
+                lbl = str(a.get("label", "")).strip()
+                if lbl:
+                    send_groups[key]["labels"].append(lbl)
+        elif atype == "RENAME_TMUX":
+            new_name = str(a.get("new_name") or a.get("command") or "").strip()
+            lifecycle.append((atype, sess, new_name, "", str(a.get("label", "")).strip()))
+        elif atype in ("START_TMUX", "KILL_TMUX"):
+            lifecycle.append((atype, sess, str(a.get("command", "")).strip(), str(a.get("cwd", "")).strip(), str(a.get("label", "")).strip()))
+
+    receipts = []
+    for key in send_order:
+        g = send_groups[key]
+        sess = g["session"]
+        texts = g["texts"]
+        # Join cleanly without numbering so both plain shells and AI CLIs execute cleanly
+        combined = texts[0] if len(texts) == 1 else "\n".join(texts)
+        preview = (combined.replace("\n", " ; "))[:90]
+        try:
+            send_to_tmux_pane(sess, combined)
+            receipts.append({"action_type": "SEND", "session": sess, "summary": preview, "ok": True})
+        except Exception as e:
+            receipts.append({"action_type": "SEND", "session": sess, "summary": preview, "ok": False, "error": str(e)[:180]})
+
+    for atype, sess, cmd_str, cwd_str, lbl in lifecycle:
+        clean_name = re.sub(r"[^A-Za-z0-9._-]", "-", sess)
+        try:
+            if atype == "START_TMUX":
+                tmux_cmd = ["tmux", "new-session", "-d", "-s", clean_name]
+                if cwd_str and cwd_str != "~":
+                    expanded = os.path.expanduser(cwd_str)
+                    if os.path.isdir(expanded):
+                        tmux_cmd.extend(["-c", expanded])
+                if cmd_str:
+                    tmux_cmd.append(f"{cmd_str}; exec ${'$'}{{SHELL:-bash}}")
+                subprocess.run(tmux_cmd, check=True, capture_output=True, text=True, timeout=10)
+                receipts.append({"action_type": "START_TMUX", "session": clean_name, "summary": cmd_str or "new shell", "ok": True})
+            elif atype == "KILL_TMUX":
+                subprocess.run(["tmux", "kill-session", "-t", f"={sess}"], check=True, capture_output=True, text=True, timeout=10)
+                receipts.append({"action_type": "KILL_TMUX", "session": sess, "summary": lbl or "ended session", "ok": True})
+            elif atype == "RENAME_TMUX":
+                clean_new = re.sub(r"[^A-Za-z0-9._-]", "-", cmd_str).strip("-")
+                if not clean_new:
+                    raise RuntimeError("new session name is empty")
+                subprocess.run(["tmux", "rename-session", "-t", f"={sess}", clean_new], check=True, capture_output=True, text=True, timeout=10)
+                receipts.append({"action_type": "RENAME_TMUX", "session": clean_new, "previous_session": sess, "summary": f"{sess} -> {clean_new}", "ok": True})
+        except Exception as e:
+            receipts.append({"action_type": atype, "session": sess, "summary": lbl or atype, "ok": False, "error": str(e)[:180]})
+    return receipts
+
+def load_cos_memory(cos_dir, user_msg, default_memory_md):
+    mem_path = cos_dir / "MEMORY.md"
+    if not mem_path.exists() and default_memory_md:
+        mem_path.write_text(default_memory_md, encoding="utf-8")
+    notes_dir = cos_dir / "notes"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    memory_txt = mem_path.read_text(encoding="utf-8", errors="ignore")[:5000] if mem_path.exists() else ""
+    note_files = sorted(notes_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    note_index = [p.name for p in note_files[:20]]
+    low_msg = (user_msg or "").lower()
+    matched_notes = {}
+    for nf in note_files[:12]:
+        stem = nf.stem.lower()
+        if stem in low_msg or len(matched_notes) < 2:
+            matched_notes[f"notes/{nf.name}"] = nf.read_text(encoding="utf-8", errors="ignore")[:1200]
+    return {"memory_md": memory_txt, "note_files": note_index, "note_excerpts": matched_notes}
+
+def apply_memory_updates(cos_dir, updates):
+    if not isinstance(updates, list) or not updates:
+        return []
+    learned = []
+    cos_resolved = cos_dir.resolve()
+    for u in updates[:4]:
+        if not isinstance(u, dict):
+            continue
+        rel = str(u.get("file", "")).strip().lstrip("/")
+        mode = str(u.get("mode", "append")).strip().lower()
+        summary = str(u.get("summary", "")).strip()[:120]
+        content = str(u.get("content", "")).strip()
+        if not rel or not content or not rel.endswith(".md"):
+            continue
+        if rel not in ("MEMORY.md", "AGENTS.md") and not rel.startswith("notes/"):
+            rel = "notes/" + re.sub(r"[^A-Za-z0-9._-]", "-", pathlib.Path(rel).name)
+        target = (cos_dir / rel).resolve()
+        if not str(target).startswith(str(cos_resolved) + os.sep):
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if mode == "replace":
+                target.write_text(content + "\n", encoding="utf-8")
+            else:
+                existing = target.read_text(encoding="utf-8", errors="ignore") if target.exists() else ""
+                if content not in existing:
+                    sep = "\n\n" if existing.strip() else ""
+                    target.write_text(existing.rstrip() + sep + content + "\n", encoding="utf-8")
+            learned.append({"file": rel, "summary": summary or f"Updated {rel}"})
+        except Exception:
+            pass
+    return learned
 
 def capture_vault_context(snap, user_msg):
     # Fast read-only context pull from canonical vault on delllap:/home/paul/ObsidianVault_Final
@@ -590,11 +871,17 @@ def try_cli(bin_name, args_fn, prompt, cos_dir, timeout_s=65):
 
 def main():
     payload = json.loads(base64.b64decode(sys.argv[1]).decode("utf-8"))
-    user_msg = payload.get("prompt", "Give me a Chief of Staff briefing across all tmux sessions.")
+    user_msg = payload.get("prompt", "Give me a Chief of Staff briefing.")
     backend = payload.get("backend", "auto")
     conv_id = payload.get("conversation_id") or ""
     history = payload.get("history") or []
     default_agents = payload.get("default_agents_md", "")
+    default_memory = payload.get("default_memory_md", "")
+    full_scan = bool(payload.get("full_scan", False))
+    if not full_scan:
+        low_q = user_msg.lower()
+        if any(k in low_q for k in ("full scan", "scan all", "all tmux", "all sessions", "brief me", "briefing", "tmux status", "what's running", "whats running")):
+            full_scan = True
 
     cos_dir = pathlib.Path.home() / ".config/paullm-cos"
     cos_dir.mkdir(parents=True, exist_ok=True)
@@ -602,23 +889,24 @@ def main():
     if not agents_path.exists() and default_agents:
         agents_path.write_text(default_agents, encoding="utf-8")
     agents_md = agents_path.read_text(encoding="utf-8")[:6000] if agents_path.exists() else default_agents
+    mem_ctx = load_cos_memory(cos_dir, user_msg, default_memory)
     schema_path = cos_dir / "briefing-schema.json"
     schema_path.write_text(json.dumps(SCHEMA, indent=2), encoding="utf-8")
 
-    snap = capture_tmux()
+    snap = capture_tmux(full_scan=full_scan, user_msg=user_msg)
     vault_ctx = capture_vault_context(snap, user_msg)
     schema_hint = json.dumps(SCHEMA)
     system_prompt = (
         agents_md.strip() + "\n\n"
         "OUTPUT CONTRACT: Return ONLY a valid JSON object matching this schema:\n"
         + schema_hint + "\n"
-        "For full tmux briefings, include all captured tmux sessions in `sessions` sorted by urgency "
-        "(NEEDS_DECISION, BLOCKED, WAITING_INPUT, RUNNING, DONE, IDLE). "
-        "For broader vault/strategy/priority questions, focus `reply` on the big picture and include ONLY "
-        "the relevant tmux sessions in `sessions` (or `[]` if tmux is not relevant). "
-        "Whenever you use facts from the canonical vault on delllap, include those notes in `vault_refs` "
-        "with exact Perlite URLs (`https://delllap.tailfaa66b.ts.net/wiki/?link=/<path-without-.md>`). "
-        "Keep `reply` as crisp human-readable prose/bullets, never raw JSON."
+        f"SCAN MODE: full_scan={str(full_scan).lower()}.\n"
+        "- Put actions Paul EXPLICITLY requested in chat into `execute_now` (they run IMMEDIATELY without nagging for approval; merge multiple commands for the same session into ONE SEND!). Rename requests use RENAME_TMUX with session + new_name.\n"
+        "- Put YOUR OWN proactive suggestions (things Paul did not explicitly command) into `orchestrator_actions`.\n"
+        "- Only include `sessions` entries when full_scan=true or for specific sessions relevant to Paul's question.\n"
+        "- Emit `memory_updates` whenever Paul shares preferences, corrections, decisions, or durable project facts.\n"
+        "- Cite vault notes used in `vault_refs` with Perlite URLs (`https://delllap.tailfaa66b.ts.net/wiki/?link=/<path-without-.md>`).\n"
+        "- Keep `reply` natural, conversational, and concise (never raw JSON)."
     )
 
     hist_block = ""
@@ -626,11 +914,13 @@ def main():
         lines = [f"- {h.get('role','user').upper()}: {str(h.get('text',''))[:400]}" for h in history[-6:]]
         hist_block = "RECENT CHAT HISTORY:\n" + "\n".join(lines) + "\n\n"
 
+    tmux_label = "FULL LIVE TMUX SNAPSHOT" if full_scan else "TMUX SESSION DIRECTORY (pane output omitted unless session was named)"
     user_prompt = (
         hist_block
+        + "ASSISTANT WORKING MEMORY (~/.config/paullm-cos/MEMORY.md & notes/):\n" + json.dumps(mem_ctx) + "\n\n"
         + "USER REQUEST:\n" + user_msg + "\n\n"
-        + "LIVE TMUX SNAPSHOT:\n" + json.dumps(snap) + "\n\n"
-        + "CANONICAL VAULT CONTEXT (delllap:/home/paul/ObsidianVault_Final — you may also spin up read-only subagents to query `ssh -o BatchMode=yes delllap ...` if deeper vault info is needed):\n"
+        + f"{tmux_label}:\n" + json.dumps(snap) + "\n\n"
+        + "CANONICAL VAULT CONTEXT (delllap:/home/paul/ObsidianVault_Final — spin up read-only subagents via `ssh -o BatchMode=yes delllap ...` if deeper vault info is needed):\n"
         + json.dumps(vault_ctx)
     )
     combined_prompt = system_prompt + "\n\n" + user_prompt
@@ -676,13 +966,19 @@ def main():
         return
 
     parsed, used_backend, used_model, next_conv_id = result
+    executed_receipts = execute_requested_actions(parsed.get("execute_now"))
+    learned_notes = apply_memory_updates(cos_dir, parsed.get("memory_updates"))
+
     print(json.dumps({
         "ok": True,
         "backend": used_backend,
         "model": used_model,
         "conversation_id": next_conv_id,
         "scanned_count": len(snap),
+        "did_full_scan": full_scan,
         "vault_notes_checked": len(vault_ctx.get("excerpts") or []),
+        "executed_receipts": executed_receipts,
+        "learned_notes": learned_notes,
         "snapshot_meta": {s["session"]: {"cmd": s["cmd"], "child_cmds": s["child_cmds"], "title": s["title"]} for s in snap},
         "data": parsed,
     }))
@@ -691,14 +987,16 @@ if __name__ == "__main__":
     main()
 """.trimIndent()
 
-    suspend fun loadAgentsMd(bridge: TerminalBridge): Result<String> {
-        val seedB64 = Base64.encodeToString(DEFAULT_AGENTS_MD.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+    suspend fun loadCosFile(bridge: TerminalBridge, fileName: String): Result<String> {
+        val safeFile = if (fileName == "MEMORY.md") "MEMORY.md" else "AGENTS.md"
+        val seed = if (safeFile == "MEMORY.md") DEFAULT_MEMORY_MD else DEFAULT_AGENTS_MD
+        val seedB64 = Base64.encodeToString(seed.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
         val script = """
             mkdir -p "${'$'}HOME/.config/paullm-cos"
-            if [ ! -f "${'$'}HOME/.config/paullm-cos/AGENTS.md" ]; then
-              printf '%s' '$seedB64' | base64 -d > "${'$'}HOME/.config/paullm-cos/AGENTS.md"
+            if [ ! -f "${'$'}HOME/.config/paullm-cos/$safeFile" ]; then
+              printf '%s' '$seedB64' | base64 -d > "${'$'}HOME/.config/paullm-cos/$safeFile"
             fi
-            cat "${'$'}HOME/.config/paullm-cos/AGENTS.md"
+            cat "${'$'}HOME/.config/paullm-cos/$safeFile"
         """.trimIndent()
         val res = bridge.execCommand(PaullmShell.wrapLoginShell(script), timeoutMs = 10_000L)
         return if (res.error != null) {
@@ -708,16 +1006,17 @@ if __name__ == "__main__":
         }
     }
 
-    suspend fun saveAgentsMd(bridge: TerminalBridge, content: String): Result<Unit> {
+    suspend fun saveCosFile(bridge: TerminalBridge, fileName: String, content: String): Result<Unit> {
+        val safeFile = if (fileName == "MEMORY.md") "MEMORY.md" else "AGENTS.md"
         val b64 = Base64.encodeToString(content.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
         val script = """
             mkdir -p "${'$'}HOME/.config/paullm-cos"
-            printf '%s' '$b64' | base64 -d > "${'$'}HOME/.config/paullm-cos/AGENTS.md.tmp"
-            mv "${'$'}HOME/.config/paullm-cos/AGENTS.md.tmp" "${'$'}HOME/.config/paullm-cos/AGENTS.md"
+            printf '%s' '$b64' | base64 -d > "${'$'}HOME/.config/paullm-cos/$safeFile.tmp"
+            mv "${'$'}HOME/.config/paullm-cos/$safeFile.tmp" "${'$'}HOME/.config/paullm-cos/$safeFile"
         """.trimIndent()
         val res = bridge.execCommand(PaullmShell.wrapLoginShell(script), timeoutMs = 10_000L)
         return if (!res.isSuccess) {
-            Result.failure(IllegalStateException(res.error ?: res.stderr.ifBlank { "Failed to save AGENTS.md" }))
+            Result.failure(IllegalStateException(res.error ?: res.stderr.ifBlank { "Failed to save $safeFile" }))
         } else {
             Result.success(Unit)
         }
@@ -728,17 +1027,41 @@ if __name__ == "__main__":
         sessionName: String,
         text: String,
     ): Result<Unit> {
-        val target = "=${sessionName}:"
-        val textB64 = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-        val script = """
-            MSG=${'$'}(printf '%s' '$textB64' | base64 -d)
-            tmux send-keys -t ${PaullmShell.quote(target)} -l -- "${'$'}MSG" && tmux send-keys -t ${PaullmShell.quote(target)} Enter
+        val reqObj = JSONObject().apply {
+            put("session", sessionName)
+            put("text", text)
+        }
+        val b64 = Base64.encodeToString(reqObj.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+        val py = """
+            import base64, json, subprocess, sys, time
+            d = json.loads(base64.b64decode(sys.argv[1]).decode('utf-8'))
+            sess, text = d['session'], d['text']
+            p = subprocess.run(['tmux', 'display-message', '-p', '-t', f'={sess}:', '#{pane_id}\t#{pane_in_mode}'], capture_output=True, text=True, timeout=5)
+            if p.returncode != 0 or not p.stdout.strip():
+                sys.stderr.write(p.stderr.strip() or f'tmux session {sess} not found')
+                sys.exit(1)
+            parts = p.stdout.strip().split('\t')
+            pane_id = parts[0]
+            if len(parts) > 1 and parts[1] == '1':
+                subprocess.run(['tmux', 'send-keys', '-t', pane_id, '-X', 'cancel'], capture_output=True, timeout=5)
+                time.sleep(0.12)
+            clean = text.replace('\r\n', '\n').strip('\n')
+            if '\n' in clean:
+                buf = f'cos_{int(time.time()*1000)}'
+                subprocess.run(['tmux', 'load-buffer', '-b', buf, '-'], input=clean, text=True, check=True, timeout=5)
+                subprocess.run(['tmux', 'paste-buffer', '-p', '-d', '-b', buf, '-t', pane_id], check=True, timeout=5)
+            else:
+                subprocess.run(['tmux', 'send-keys', '-t', pane_id, '-l', '--', clean], check=True, timeout=5)
+            time.sleep(0.30)
+            subprocess.run(['tmux', 'send-keys', '-t', pane_id, 'C-m'], check=True, timeout=5)
         """.trimIndent()
-        val res = bridge.execCommand(PaullmShell.wrapLoginShell(script), timeoutMs = 10_000L)
+        val pyB64 = Base64.encodeToString(py.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+        val script = "python3 -c \"\$(printf '%s' '$pyB64' | base64 -d)\" '$b64'"
+        val res = bridge.execCommand(PaullmShell.wrapLoginShell(script), timeoutMs = 12_000L)
         return if (!res.isSuccess) {
             Result.failure(
                 IllegalStateException(
-                    res.error ?: res.stderr.ifBlank { "tmux send-keys failed for '$sessionName'" },
+                    res.error ?: res.stderr.ifBlank { "tmux send failed for '$sessionName'" },
                 ),
             )
         } else {
@@ -753,6 +1076,7 @@ if __name__ == "__main__":
         conversationId: String?,
         recentHistory: List<CosChatMessage>,
         knownSessions: List<TmuxSessionInfo>,
+        fullScan: Boolean = false,
     ): Result<CosBriefingPayload> {
         val histArray = JSONArray()
         recentHistory.takeLast(6).forEach { msg ->
@@ -769,6 +1093,8 @@ if __name__ == "__main__":
             put("conversation_id", conversationId.orEmpty())
             put("history", histArray)
             put("default_agents_md", DEFAULT_AGENTS_MD)
+            put("default_memory_md", DEFAULT_MEMORY_MD)
+            put("full_scan", fullScan)
         }
         val reqB64 = Base64.encodeToString(reqObj.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
         val runnerB64 = Base64.encodeToString(PYTHON_RUNNER.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
@@ -825,16 +1151,23 @@ if __name__ == "__main__":
                 val out = mutableListOf<CosAction>()
                 for (i in 0 until arr.length()) {
                     val obj = arr.optJSONObject(i) ?: continue
-                    val label = obj.optString("label").trim()
-                    if (label.isEmpty()) continue
                     val type = CosActionType.parse(obj.optString("action_type", "SEND"))
                     val targetSession = obj.optString("session").trim().ifEmpty { fallbackSession }
                     val send = obj.optString("send").trim()
                     val command = obj.optString("command").trim()
                     val cwd = obj.optString("cwd").trim()
-                    val risky = obj.optBoolean("risky", type != CosActionType.SEND)
+                    val newName = obj.optString("new_name").trim().ifEmpty {
+                        if (type == CosActionType.RENAME_TMUX) command else ""
+                    }
+                    var label = obj.optString("label").trim()
+                    if (label.isEmpty() && type == CosActionType.RENAME_TMUX && newName.isNotEmpty()) {
+                        label = "Rename to $newName"
+                    }
+                    if (label.isEmpty()) continue
+                    val risky = obj.optBoolean("risky", type != CosActionType.SEND && type != CosActionType.RENAME_TMUX)
                     if (type == CosActionType.SEND && (send.isEmpty() || targetSession.isEmpty())) continue
                     if ((type == CosActionType.START_TMUX || type == CosActionType.KILL_TMUX) && targetSession.isEmpty()) continue
+                    if (type == CosActionType.RENAME_TMUX && (targetSession.isEmpty() || newName.isEmpty())) continue
                     out.add(
                         CosAction(
                             actionType = type,
@@ -843,6 +1176,7 @@ if __name__ == "__main__":
                             sendText = send,
                             command = command,
                             cwd = cwd,
+                            newName = newName,
                             risky = risky,
                         ),
                     )
@@ -910,16 +1244,55 @@ if __name__ == "__main__":
                 }
             }
 
+            val parsedExecuted = mutableListOf<CosExecutedReceipt>()
+            val execArr = env.optJSONArray("executed_receipts")
+            if (execArr != null) {
+                for (i in 0 until execArr.length()) {
+                    val r = execArr.optJSONObject(i) ?: continue
+                    val sess = r.optString("session").trim()
+                    if (sess.isEmpty()) continue
+                    parsedExecuted.add(
+                        CosExecutedReceipt(
+                            actionType = CosActionType.parse(r.optString("action_type")),
+                            session = sess,
+                            summary = r.optString("summary").trim(),
+                            ok = r.optBoolean("ok", true),
+                            error = r.optString("error").trim().takeIf { it.isNotEmpty() && it != "null" },
+                            previousSession = r.optString("previous_session").trim().takeIf { it.isNotEmpty() && it != "null" },
+                        ),
+                    )
+                }
+            }
+
+            val parsedLearned = mutableListOf<CosLearnedNote>()
+            val learnedArr = env.optJSONArray("learned_notes")
+            if (learnedArr != null) {
+                for (i in 0 until learnedArr.length()) {
+                    val l = learnedArr.optJSONObject(i) ?: continue
+                    val f = l.optString("file").trim()
+                    if (f.isEmpty()) continue
+                    parsedLearned.add(
+                        CosLearnedNote(
+                            file = f,
+                            summary = l.optString("summary").trim().ifEmpty { "Updated $f" },
+                        ),
+                    )
+                }
+            }
+
             CosBriefingPayload(
                 headline = data.optString("headline").trim().ifEmpty { "Briefing complete" },
                 reply = data.optString("reply").trim(),
                 sessions = parsedSessions,
                 orchestratorActions = orchActions,
+                executedReceipts = parsedExecuted,
+                learnedNotes = parsedLearned,
                 vaultRefs = parsedVaultRefs,
                 backendUsed = env.optString("backend", backend.label),
                 modelUsed = env.optString("model", backend.label),
                 conversationId = env.optString("conversation_id").takeIf { it.isNotBlank() && it != "null" },
                 scannedCount = env.optInt("scanned_count", parsedSessions.size),
+                didFullTmuxScan = env.optBoolean("did_full_scan", fullScan),
                 vaultNotesChecked = env.optInt("vault_notes_checked", parsedVaultRefs.size),
             )
         }
@@ -1102,15 +1475,19 @@ fun ChiefOfStaffChatView(
     bridge: TerminalBridge,
     disconnected: Boolean,
     knownSessions: List<TmuxSessionInfo>,
+    liveSessions: List<CosSessionDecision>,
     messages: List<CosChatMessage>,
     selectedBackend: CosBackend,
     isRunning: Boolean,
     onSelectBackend: (CosBackend) -> Unit,
     onSendPrompt: (String) -> Unit,
+    onRunFullScan: () -> Unit,
     onClearChat: () -> Unit,
     onJumpToSession: (String) -> Unit,
     onOpenUrl: (String) -> Unit,
+    onActionsExecuted: (List<CosAction>) -> Unit,
     onSessionsChanged: () -> Unit,
+    onSessionRenamed: (String, String) -> Unit = { _, _ -> },
     onMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -1119,11 +1496,16 @@ fun ChiefOfStaffChatView(
     val listState = rememberLazyListState()
     var inputText by remember(bridge.host.id) { mutableStateOf("") }
     var showAgentsDialog by remember { mutableStateOf(false) }
+    var activeCosDocTab by remember { mutableStateOf("AGENTS.md") }
     var agentsContent by remember { mutableStateOf("") }
     var agentsLoading by remember { mutableStateOf(false) }
     var agentsSaving by remember { mutableStateOf(false) }
-    var pendingPermissionAction by remember { mutableStateOf<CosAction?>(null) }
+    var pendingBatchPermission by remember { mutableStateOf<List<CosAction>?>(null) }
+    var renameTarget by remember { mutableStateOf<String?>(null) }
+    var isExecutingBatch by remember { mutableStateOf(false) }
+    var liveBoardExpanded by remember(bridge.host.id) { mutableStateOf(false) }
     val completedActionIds = remember(bridge.host.id) { mutableStateListOf<String>() }
+    val deselectedActionIds = remember(bridge.host.id) { mutableStateMapOf<String, Boolean>() }
     var isListeningVoice by remember { mutableStateOf(false) }
     var speechRecognizer by remember { mutableStateOf<SpeechRecognizer?>(null) }
 
@@ -1215,112 +1597,200 @@ fun ChiefOfStaffChatView(
         if (granted) startVoiceInput() else onMessage("Microphone permission required for voice")
     }
 
-    fun executeApprovedAction(action: CosAction, openAfterStart: Boolean = false) {
+    fun executeBatchActions(actions: List<CosAction>, openStartedSession: Boolean = false) {
+        if (actions.isEmpty() || isExecutingBatch) return
+        isExecutingBatch = true
         scope.launch {
-            when (action.actionType) {
-                CosActionType.SEND -> {
-                    ChiefOfStaffEngine.sendToTmuxSession(bridge, action.session, action.sendText)
-                        .onSuccess {
-                            if (action.id !in completedActionIds) completedActionIds.add(action.id)
-                            onMessage("Sent to '${action.session}': ${action.sendText.take(40)}")
-                        }
-                        .onFailure { onMessage(it.message ?: "Send failed") }
-                }
+            val succeeded = mutableListOf<CosAction>()
+            var lastError: String? = null
+            var startedToOpen: String? = null
+            var touchedSessions = false
 
-                CosActionType.START_TMUX -> {
-                    TmuxRemoteController.createDetachedSession(
-                        bridge = bridge,
-                        rawName = action.session,
-                        preset = TmuxLaunchPreset.SHELL,
-                        customCommand = action.command.ifBlank { null },
-                        yoloMode = true,
-                        workingDir = action.cwd.ifBlank { null },
-                    ).onSuccess { createdName ->
-                        if (action.id !in completedActionIds) completedActionIds.add(action.id)
-                        onSessionsChanged()
-                        onMessage("Started tmux session '$createdName'")
-                        if (openAfterStart) {
-                            onJumpToSession(createdName)
-                        }
-                    }.onFailure { onMessage(it.message ?: "Failed to start '${action.session}'") }
-                }
+            for (action in actions) {
+                when (action.actionType) {
+                    CosActionType.SEND -> {
+                        ChiefOfStaffEngine.sendToTmuxSession(bridge, action.session, action.sendText)
+                            .onSuccess {
+                                if (action.id !in completedActionIds) completedActionIds.add(action.id)
+                                succeeded.add(action)
+                            }
+                            .onFailure { lastError = "${action.session}: ${it.message ?: "send failed"}" }
+                    }
 
-                CosActionType.KILL_TMUX -> {
-                    TmuxRemoteController.killSession(bridge, action.session)
-                        .onSuccess {
+                    CosActionType.START_TMUX -> {
+                        TmuxRemoteController.createDetachedSession(
+                            bridge = bridge,
+                            rawName = action.session,
+                            preset = TmuxLaunchPreset.SHELL,
+                            customCommand = action.command.ifBlank { null },
+                            yoloMode = true,
+                            workingDir = action.cwd.ifBlank { null },
+                        ).onSuccess { createdName ->
                             if (action.id !in completedActionIds) completedActionIds.add(action.id)
-                            onSessionsChanged()
-                            onMessage("Ended tmux session '${action.session}'")
-                        }
-                        .onFailure { onMessage(it.message ?: "Failed to kill '${action.session}'") }
+                            succeeded.add(action.copy(session = createdName))
+                            touchedSessions = true
+                            if (openStartedSession) startedToOpen = createdName
+                        }.onFailure { lastError = "${action.session}: ${it.message ?: "start failed"}" }
+                    }
+
+                    CosActionType.KILL_TMUX -> {
+                        TmuxRemoteController.killSession(bridge, action.session)
+                            .onSuccess {
+                                if (action.id !in completedActionIds) completedActionIds.add(action.id)
+                                succeeded.add(action)
+                                touchedSessions = true
+                            }
+                            .onFailure { lastError = "${action.session}: ${it.message ?: "kill failed"}" }
+                    }
+
+                    CosActionType.RENAME_TMUX -> {
+                        val requested = action.newName.ifBlank { action.command }
+                        TmuxRemoteController.renameSession(bridge, action.session, requested)
+                            .onSuccess { createdName ->
+                                if (action.id !in completedActionIds) completedActionIds.add(action.id)
+                                succeeded.add(action.copy(newName = createdName))
+                                touchedSessions = true
+                                onSessionRenamed(action.session, createdName)
+                            }
+                            .onFailure { lastError = "${action.session}: ${it.message ?: "rename failed"}" }
+                    }
                 }
             }
+
+            if (succeeded.isNotEmpty()) {
+                onActionsExecuted(succeeded)
+            }
+            if (touchedSessions) {
+                onSessionsChanged()
+            }
+            val msg = when {
+                succeeded.isEmpty() && lastError != null -> "Action failed: $lastError"
+                succeeded.size == 1 && lastError == null -> {
+                    val only = succeeded.first()
+                    when (only.actionType) {
+                        CosActionType.SEND -> "Sent to '${only.session}'"
+                        CosActionType.START_TMUX -> "Started '${only.session}'"
+                        CosActionType.KILL_TMUX -> "Ended '${only.session}'"
+                        CosActionType.RENAME_TMUX -> "Renamed '${only.session}' to '${only.newName}'"
+                    }
+                }
+                lastError == null -> "Executed ${succeeded.size} actions (${succeeded.joinToString(", ") { it.session }})"
+                else -> "Ran ${succeeded.size}/${actions.size} · failed: $lastError"
+            }
+            onMessage(msg)
+            isExecutingBatch = false
+            startedToOpen?.let { onJumpToSession(it) }
         }
     }
 
-    pendingPermissionAction?.let { action ->
-        val isKill = action.actionType == CosActionType.KILL_TMUX
-        val isStart = action.actionType == CosActionType.START_TMUX
+    renameTarget?.let { currentName ->
+        TmuxRenameDialog(
+            currentName = currentName,
+            onDismiss = { renameTarget = null },
+            onConfirm = { edited ->
+                renameTarget = null
+                scope.launch {
+                    TmuxRemoteController.renameSession(bridge, currentName, edited)
+                        .onSuccess { created ->
+                            onSessionRenamed(currentName, created)
+                            onSessionsChanged()
+                            onMessage("Renamed '$currentName' to '$created'")
+                        }
+                        .onFailure { onMessage(it.message ?: "Rename failed") }
+                }
+            },
+        )
+    }
+
+    pendingBatchPermission?.let { batch ->
+        val hasKill = batch.any { it.actionType == CosActionType.KILL_TMUX }
+        val singleStart = batch.size == 1 && batch.first().actionType == CosActionType.START_TMUX
         AlertDialog(
-            onDismissRequest = { pendingPermissionAction = null },
+            onDismissRequest = { pendingBatchPermission = null },
             title = {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Icon(
-                        if (isStart) Icons.Default.Add else Icons.Default.Warning,
+                        if (singleStart) Icons.Default.Add else Icons.Default.Warning,
                         contentDescription = null,
-                        tint = if (isKill) CosRed else if (isStart) CosCyan else CosAmber,
+                        tint = if (hasKill) CosRed else if (singleStart) CosCyan else CosAmber,
                     )
                     Text(
-                        when (action.actionType) {
-                            CosActionType.START_TMUX -> "Permission: Start tmux Session"
-                            CosActionType.KILL_TMUX -> "Permission: End tmux Session"
-                            CosActionType.SEND -> "Confirm Risky Send"
+                        if (batch.size == 1) {
+                            when (batch.first().actionType) {
+                                CosActionType.START_TMUX -> "Approve Suggested Start"
+                                CosActionType.KILL_TMUX -> "Approve Suggested End"
+                                CosActionType.RENAME_TMUX -> "Approve Suggested Rename"
+                                CosActionType.SEND -> "Confirm Risky Suggestion"
+                            }
+                        } else {
+                            "Approve Suggested Actions (${batch.size})"
                         },
                     )
                 }
             },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    when (action.actionType) {
-                        CosActionType.START_TMUX -> {
-                            Text("Allow Chief of Staff to start a new tmux session on ${bridge.host.nickname}?")
-                            Surface(
-                                shape = RoundedCornerShape(10.dp),
-                                color = Color(0xFF0F172A),
-                                border = BorderStroke(1.dp, CosCardBorder),
-                            ) {
-                                Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text("Session: ${action.session}", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, color = CosCyan)
-                                    if (action.cwd.isNotBlank()) {
-                                        Text("Dir: ${action.cwd}", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, color = CosMuted)
-                                    }
-                                    if (action.command.isNotBlank()) {
-                                        Text("Cmd: ${action.command}", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, color = Color.White)
-                                    }
-                                }
-                            }
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 320.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = "Run these suggested actions on ${bridge.host.nickname}:",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = CosMuted,
+                    )
+                    batch.forEach { action ->
+                        val accent = when {
+                            action.actionType == CosActionType.KILL_TMUX -> CosRed
+                            action.actionType == CosActionType.START_TMUX || action.actionType == CosActionType.RENAME_TMUX -> CosCyan
+                            action.requiresPermissionDialog -> CosAmber
+                            else -> CosCyan
                         }
-
-                        CosActionType.KILL_TMUX -> {
-                            Text(
-                                "Allow Chief of Staff to permanently terminate tmux session '${action.session}' on ${bridge.host.nickname}? Running processes inside it will stop.",
-                            )
-                        }
-
-                        CosActionType.SEND -> {
-                            Text("Send this potentially risky command to tmux session '${action.session}'?")
-                            Surface(
-                                shape = RoundedCornerShape(10.dp),
-                                color = Color(0xFF0F172A),
-                                border = BorderStroke(1.dp, CosAmber.copy(alpha = 0.5f)),
-                            ) {
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = Color(0xFF0F172A),
+                            border = BorderStroke(1.dp, accent.copy(alpha = 0.45f)),
+                        ) {
+                            Column(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                                 Text(
-                                    text = action.sendText,
-                                    modifier = Modifier.padding(10.dp),
-                                    fontFamily = FontFamily.Monospace,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color.White,
+                                    text = "${action.actionType.wireName} → ${action.session}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = accent,
                                 )
+                                when (action.actionType) {
+                                    CosActionType.SEND -> Text(
+                                        text = action.sendText,
+                                        fontFamily = FontFamily.Monospace,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color.White,
+                                        maxLines = 5,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    CosActionType.START_TMUX -> {
+                                        if (action.cwd.isNotBlank()) {
+                                            Text("dir: ${action.cwd}", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall, color = CosMuted)
+                                        }
+                                        Text(
+                                            text = action.command.ifBlank { "default shell" },
+                                            fontFamily = FontFamily.Monospace,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = Color.White,
+                                        )
+                                    }
+                                    CosActionType.KILL_TMUX -> Text(
+                                        text = "Permanently terminates session '${action.session}'.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color(0xFFFCA5A5),
+                                    )
+                                    CosActionType.RENAME_TMUX -> Text(
+                                        text = "Rename '${action.session}' to '${action.newName.ifBlank { action.command }}'.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color.White,
+                                    )
+                                }
                             }
                         }
                     }
@@ -1328,52 +1798,82 @@ fun ChiefOfStaffChatView(
             },
             confirmButton = {
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (isStart) {
+                    if (singleStart) {
                         OutlinedButton(
                             onClick = {
-                                pendingPermissionAction = null
-                                executeApprovedAction(action, openAfterStart = false)
+                                pendingBatchPermission = null
+                                executeBatchActions(batch, openStartedSession = false)
                             },
                         ) { Text("Start Detached") }
                         Button(
                             onClick = {
-                                pendingPermissionAction = null
-                                executeApprovedAction(action, openAfterStart = true)
+                                pendingBatchPermission = null
+                                executeBatchActions(batch, openStartedSession = true)
                             },
                         ) { Text("Start & Open") }
                     } else {
                         Button(
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isKill) CosRed else CosAmber,
+                                containerColor = if (hasKill) CosRed else CosAmber,
                             ),
                             onClick = {
-                                pendingPermissionAction = null
-                                executeApprovedAction(action)
+                                pendingBatchPermission = null
+                                executeBatchActions(batch)
                             },
                         ) {
-                            Text(if (isKill) "Approve & End" else "Approve & Send")
+                            Text(if (batch.size == 1) "Approve" else "Run All (${batch.size})")
                         }
                     }
                 }
             },
             dismissButton = {
-                TextButton(onClick = { pendingPermissionAction = null }) { Text("Cancel") }
+                TextButton(onClick = { pendingBatchPermission = null }) { Text("Cancel") }
             },
         )
     }
 
     if (showAgentsDialog) {
+        fun loadDocTab(fileName: String) {
+            activeCosDocTab = fileName
+            agentsLoading = true
+            scope.launch {
+                ChiefOfStaffEngine.loadCosFile(bridge, fileName)
+                    .onSuccess { agentsContent = it }
+                    .onFailure {
+                        agentsContent = if (fileName == "MEMORY.md") {
+                            ChiefOfStaffEngine.DEFAULT_MEMORY_MD
+                        } else {
+                            ChiefOfStaffEngine.DEFAULT_AGENTS_MD
+                        }
+                        onMessage(it.message ?: "Could not read $fileName")
+                    }
+                agentsLoading = false
+            }
+        }
         AlertDialog(
             onDismissRequest = { showAgentsDialog = false },
             title = {
-                Column {
-                    Text("Chief of Staff AGENTS.md")
-                    Text(
-                        text = ChiefOfStaffEngine.REMOTE_AGENTS_PATH,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = FontFamily.Monospace,
-                        color = CosCyan,
-                    )
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Chief of Staff Memory")
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf("AGENTS.md", "MEMORY.md").forEach { tab ->
+                            val selected = activeCosDocTab == tab
+                            Surface(
+                                onClick = { if (!agentsSaving) loadDocTab(tab) },
+                                shape = RoundedCornerShape(999.dp),
+                                color = if (selected) CosCyan.copy(alpha = 0.22f) else Color(0xFF1E293B),
+                                border = BorderStroke(1.dp, if (selected) CosCyan else CosCardBorder),
+                            ) {
+                                Text(
+                                    text = tab,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (selected) CosCyan else CosMuted,
+                                )
+                            }
+                        }
+                    }
                 }
             },
             text = {
@@ -1387,7 +1887,7 @@ fun ChiefOfStaffChatView(
                         onValueChange = { agentsContent = it },
                         modifier = Modifier.fillMaxWidth().height(300.dp),
                         textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                        label = { Text("Remote Orchestrator Instructions") },
+                        label = { Text("~/.config/paullm-cos/$activeCosDocTab") },
                     )
                 }
             },
@@ -1397,15 +1897,15 @@ fun ChiefOfStaffChatView(
                     onClick = {
                         agentsSaving = true
                         scope.launch {
-                            ChiefOfStaffEngine.saveAgentsMd(bridge, agentsContent)
+                            ChiefOfStaffEngine.saveCosFile(bridge, activeCosDocTab, agentsContent)
                                 .onSuccess {
                                     agentsSaving = false
                                     showAgentsDialog = false
-                                    onMessage("Saved ${ChiefOfStaffEngine.REMOTE_AGENTS_PATH}")
+                                    onMessage("Saved ~/.config/paullm-cos/$activeCosDocTab")
                                 }
                                 .onFailure {
                                     agentsSaving = false
-                                    onMessage(it.message ?: "Failed to save AGENTS.md")
+                                    onMessage(it.message ?: "Failed to save $activeCosDocTab")
                                 }
                         }
                     },
@@ -1456,9 +1956,10 @@ fun ChiefOfStaffChatView(
                         Surface(
                             onClick = {
                                 showAgentsDialog = true
+                                activeCosDocTab = "AGENTS.md"
                                 agentsLoading = true
                                 scope.launch {
-                                    ChiefOfStaffEngine.loadAgentsMd(bridge)
+                                    ChiefOfStaffEngine.loadCosFile(bridge, "AGENTS.md")
                                         .onSuccess { agentsContent = it }
                                         .onFailure {
                                             agentsContent = ChiefOfStaffEngine.DEFAULT_AGENTS_MD
@@ -1477,13 +1978,13 @@ fun ChiefOfStaffChatView(
                                 horizontalArrangement = Arrangement.spacedBy(4.dp),
                             ) {
                                 Icon(Icons.Default.Description, contentDescription = null, tint = CosCyan, modifier = Modifier.size(13.dp))
-                                Text("AGENTS.md", style = MaterialTheme.typography.labelSmall, color = Color.White)
+                                Text("Memory", style = MaterialTheme.typography.labelSmall, color = Color.White)
                             }
                         }
                         Surface(
                             onClick = {
                                 if (!isRunning && !disconnected) {
-                                    onSendPrompt("Give me an executive Chief of Staff briefing combining my canonical vault on delllap and active tmux sessions. Highlight top priorities, open decisions, and blockers.")
+                                    onRunFullScan()
                                 }
                             },
                             shape = RoundedCornerShape(999.dp),
@@ -1501,7 +2002,7 @@ fun ChiefOfStaffChatView(
                                     Icon(Icons.Default.Refresh, contentDescription = null, tint = CosCyan, modifier = Modifier.size(13.dp))
                                 }
                                 Text(
-                                    text = if (isRunning) "Scanning…" else "Brief Now",
+                                    text = if (isRunning) "Thinking…" else "Full Scan",
                                     style = MaterialTheme.typography.labelSmall,
                                     fontWeight = FontWeight.SemiBold,
                                     color = CosCyan,
@@ -1538,6 +2039,147 @@ fun ChiefOfStaffChatView(
                                 fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
                                 color = if (active) CosCyan else CosMuted,
                             )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Live-Updating Collapsible Session Pulse Board (single source of truth; never duplicates in chat!)
+        if (liveSessions.isNotEmpty()) {
+            val decCount = liveSessions.count { it.urgency == SessionUrgency.NEEDS_DECISION }
+            val blkCount = liveSessions.count { it.urgency == SessionUrgency.BLOCKED }
+            val runCount = liveSessions.count { it.urgency == SessionUrgency.RUNNING }
+            val waitCount = liveSessions.count { it.urgency == SessionUrgency.WAITING_INPUT }
+            Surface(
+                color = Color(0xFF0E131D),
+                border = BorderStroke(0.5.dp, CosCardBorder),
+            ) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { liveBoardExpanded = !liveBoardExpanded }
+                            .padding(horizontal = 12.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .horizontalScroll(rememberScrollState()),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Text(
+                                text = "Live Status",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White,
+                            )
+                            if (decCount > 0) CosCountPill("$decCount Decision", CosAmber)
+                            if (blkCount > 0) CosCountPill("$blkCount Blocked", CosRed)
+                            if (waitCount > 0) CosCountPill("$waitCount Waiting", Color(0xFFFBBF24))
+                            if (runCount > 0) CosCountPill("$runCount Running", CosCyan)
+                            if (decCount == 0 && blkCount == 0 && waitCount == 0 && runCount == 0) {
+                                CosCountPill("${liveSessions.size} Ready", CosGreen)
+                            }
+                        }
+                        Icon(
+                            if (liveBoardExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            contentDescription = "Toggle live session board",
+                            tint = CosMuted,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+
+                    if (liveBoardExpanded) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 220.dp)
+                                .verticalScroll(rememberScrollState())
+                                .padding(start = 10.dp, end = 10.dp, bottom = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            liveSessions.forEach { item ->
+                                val accent = urgencyColor(item.urgency)
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = CosCardBg,
+                                    border = BorderStroke(1.dp, if (item.urgency.rank <= 1) accent.copy(alpha = 0.45f) else CosCardBorder),
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    ) {
+                                        AiVendorLogo(vendor = item.vendor, size = 18.dp)
+                                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                            ) {
+                                                Text(
+                                                    text = item.session,
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    color = Color.White,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                )
+                                                Surface(
+                                                    shape = RoundedCornerShape(999.dp),
+                                                    color = accent.copy(alpha = 0.16f),
+                                                ) {
+                                                    Text(
+                                                        text = item.urgency.label,
+                                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = accent,
+                                                    )
+                                                }
+                                            }
+                                            Text(
+                                                text = item.decisionNeeded?.takeIf { it.isNotBlank() } ?: item.summary,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = Color(0xFFCBD5E1),
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                        Surface(
+                                            onClick = { renameTarget = item.session },
+                                            shape = CircleShape,
+                                            color = Color(0xFF1E293B),
+                                        ) {
+                                            Box(modifier = Modifier.size(26.dp), contentAlignment = Alignment.Center) {
+                                                Icon(
+                                                    Icons.Default.Edit,
+                                                    contentDescription = "Rename ${item.session}",
+                                                    tint = Color.White,
+                                                    modifier = Modifier.size(13.dp),
+                                                )
+                                            }
+                                        }
+                                        Surface(
+                                            onClick = { onJumpToSession(item.session) },
+                                            shape = CircleShape,
+                                            color = Color(0xFF2563EB),
+                                        ) {
+                                            Box(modifier = Modifier.size(26.dp), contentAlignment = Alignment.Center) {
+                                                Icon(
+                                                    Icons.AutoMirrored.Filled.ArrowForward,
+                                                    contentDescription = "Jump to ${item.session}",
+                                                    tint = Color.White,
+                                                    modifier = Modifier.size(14.dp),
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1627,12 +2269,22 @@ fun ChiefOfStaffChatView(
                 } else {
                     CosAssistantMessageBubble(
                         message = msg,
+                        knownSessions = knownSessions,
                         completedActionIds = completedActionIds,
-                        onActionClick = { action ->
-                            if (action.requiresPermissionDialog) {
-                                pendingPermissionAction = action
+                        deselectedActionIds = deselectedActionIds,
+                        isExecutingBatch = isExecutingBatch,
+                        onToggleActionSelected = { actionId ->
+                            if (deselectedActionIds[actionId] == true) {
+                                deselectedActionIds.remove(actionId)
                             } else {
-                                executeApprovedAction(action)
+                                deselectedActionIds[actionId] = true
+                            }
+                        },
+                        onRunBatch = { selectedActions ->
+                            if (selectedActions.any { it.requiresPermissionDialog }) {
+                                pendingBatchPermission = selectedActions
+                            } else {
+                                executeBatchActions(selectedActions)
                             }
                         },
                         onJumpToSession = onJumpToSession,
@@ -1761,8 +2413,12 @@ fun ChiefOfStaffChatView(
 @Composable
 private fun CosAssistantMessageBubble(
     message: CosChatMessage,
+    knownSessions: List<TmuxSessionInfo>,
     completedActionIds: List<String>,
-    onActionClick: (CosAction) -> Unit,
+    deselectedActionIds: Map<String, Boolean>,
+    isExecutingBatch: Boolean,
+    onToggleActionSelected: (String) -> Unit,
+    onRunBatch: (List<CosAction>) -> Unit,
     onJumpToSession: (String) -> Unit,
     onOpenUrl: (String) -> Unit,
 ) {
@@ -1785,102 +2441,112 @@ private fun CosAssistantMessageBubble(
     }
 
     val briefing = message.briefing
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Surface(
-            shape = RoundedCornerShape(16.dp, 16.dp, 16.dp, 4.dp),
-            color = CosCardBg,
-            border = BorderStroke(1.dp, CosCardBorder),
-        ) {
-            Column(modifier = Modifier.padding(13.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (briefing != null) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            text = "${briefing.backendUsed} · ${briefing.modelUsed}",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontFamily = FontFamily.Monospace,
-                            color = CosCyan,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f),
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            text = buildString {
-                                append("${briefing.scannedCount} tmux")
-                                if (briefing.vaultNotesChecked > 0) {
-                                    append(" · ${briefing.vaultNotesChecked} vault")
-                                }
-                                append(" · $timeLabel")
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = CosMuted,
-                        )
-                    }
+    val knownByName = remember(knownSessions) { knownSessions.associateBy { it.name.lowercase() } }
+
+    Surface(
+        shape = RoundedCornerShape(16.dp, 16.dp, 16.dp, 4.dp),
+        color = CosCardBg,
+        border = BorderStroke(1.dp, CosCardBorder),
+    ) {
+        Column(modifier = Modifier.padding(13.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+            if (briefing != null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     Text(
-                        text = briefing.headline,
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White,
+                        text = "${briefing.backendUsed} · ${briefing.modelUsed}",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = CosCyan,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
                     )
-                    if (briefing.reply.isNotBlank() && briefing.reply != briefing.headline) {
-                        Text(
-                            text = briefing.reply,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFFCBD5E1),
-                        )
-                    }
-                } else {
+                    Spacer(Modifier.width(8.dp))
                     Text(
-                        text = message.text,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color.White,
+                        text = buildString {
+                            if (briefing.didFullTmuxScan) {
+                                append("full scan · ")
+                            }
+                            if (briefing.vaultNotesChecked > 0) {
+                                append("${briefing.vaultNotesChecked} vault · ")
+                            }
+                            append(timeLabel)
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = CosMuted,
                     )
                 }
 
-                // Vault Note References (clickable Perlite links on delllap)
-                if (briefing != null && briefing.vaultRefs.isNotEmpty()) {
+                val bodyText = briefing.reply.ifBlank { briefing.headline }
+                Text(
+                    text = bodyText,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFFE2E8F0),
+                )
+
+                // Direct Chat-Requested Executions (already ran immediately — zero approval friction!)
+                if (briefing.executedReceipts.isNotEmpty()) {
                     Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                        Text(
-                            text = "VAULT CONTEXT (DELLLAP)",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = Color(0xFFC084FC),
-                        )
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            briefing.vaultRefs.forEach { ref ->
-                                Surface(
-                                    onClick = { onOpenUrl(ref.perliteUrl) },
-                                    shape = RoundedCornerShape(999.dp),
-                                    color = Color(0xFFA855F7).copy(alpha = 0.14f),
-                                    border = BorderStroke(1.dp, Color(0xFFA855F7).copy(alpha = 0.45f)),
+                        briefing.executedReceipts.forEach { rec ->
+                            val c = if (rec.ok) CosGreen else CosRed
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = c.copy(alpha = 0.12f),
+                                border = BorderStroke(1.dp, c.copy(alpha = 0.4f)),
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                    ) {
-                                        Icon(
-                                            Icons.Default.Description,
-                                            contentDescription = null,
-                                            tint = Color(0xFFC084FC),
-                                            modifier = Modifier.size(12.dp),
-                                        )
+                                    Icon(
+                                        if (rec.ok) Icons.Default.Check else Icons.Default.Warning,
+                                        contentDescription = null,
+                                        tint = c,
+                                        modifier = Modifier.size(14.dp),
+                                    )
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        val verb = when (rec.actionType) {
+                                            CosActionType.SEND -> "Sent to ${rec.session}"
+                                            CosActionType.START_TMUX -> "Started ${rec.session}"
+                                            CosActionType.KILL_TMUX -> "Ended ${rec.session}"
+                                            CosActionType.RENAME_TMUX -> "Renamed to ${rec.session}"
+                                        }
                                         Text(
-                                            text = ref.title,
+                                            text = if (rec.ok) verb else "$verb (failed)",
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = Color(0xFFE9D5FF),
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
+                                            fontWeight = FontWeight.Bold,
+                                            color = c,
                                         )
+                                        val detail = rec.error ?: rec.summary
+                                        if (detail.isNotBlank()) {
+                                            Text(
+                                                text = detail,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = Color(0xFFCBD5E1),
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                    }
+                                    if (rec.ok && rec.actionType != CosActionType.KILL_TMUX) {
+                                        Surface(
+                                            onClick = { onJumpToSession(rec.session) },
+                                            shape = CircleShape,
+                                            color = Color(0xFF2563EB),
+                                        ) {
+                                            Box(modifier = Modifier.size(24.dp), contentAlignment = Alignment.Center) {
+                                                Icon(
+                                                    Icons.AutoMirrored.Filled.ArrowForward,
+                                                    contentDescription = "Open ${rec.session}",
+                                                    tint = Color.White,
+                                                    modifier = Modifier.size(13.dp),
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1888,184 +2554,219 @@ private fun CosAssistantMessageBubble(
                     }
                 }
 
-                // Global Orchestrator Lifecycle Actions (START_TMUX / KILL_TMUX / cross-session SEND)
-                if (briefing != null && briefing.orchestratorActions.isNotEmpty()) {
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(
-                            text = "ORCHESTRATOR ACTIONS (PERMISSION REQUIRED)",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = CosAmber,
-                        )
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            briefing.orchestratorActions.forEach { action ->
-                                CosActionChip(
-                                    action = action,
-                                    completed = action.id in completedActionIds,
-                                    onClick = { onActionClick(action) },
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Per-Session Decision Cards bubbled up by urgency
-        if (briefing != null && briefing.sessions.isNotEmpty()) {
-            briefing.sessions.forEach { item ->
-                val accent = urgencyColor(item.urgency)
-                val highPriority = item.urgency == SessionUrgency.NEEDS_DECISION || item.urgency == SessionUrgency.BLOCKED
-                Surface(
-                    shape = RoundedCornerShape(14.dp),
-                    color = if (highPriority) Color(0xFF171B26) else Color(0xFF10141D),
-                    border = BorderStroke(
-                        width = if (highPriority) 1.2.dp else 1.dp,
-                        color = if (highPriority) accent.copy(alpha = 0.55f) else CosCardBorder,
-                    ),
-                ) {
-                    Column(
-                        modifier = Modifier.padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                // Assistant Memory Learning Receipts (AGENTS.md / MEMORY.md / notes/*.md)
+                if (briefing.learnedNotes.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                modifier = Modifier.weight(1f),
+                        briefing.learnedNotes.forEach { note ->
+                            Surface(
+                                shape = RoundedCornerShape(999.dp),
+                                color = CosCyan.copy(alpha = 0.12f),
+                                border = BorderStroke(1.dp, CosCyan.copy(alpha = 0.35f)),
                             ) {
-                                AiVendorLogo(vendor = item.vendor, size = 20.dp)
                                 Text(
-                                    text = item.session,
-                                    style = MaterialTheme.typography.titleSmall,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = Color.White,
+                                    text = "Noted in ${note.file}: ${note.summary}",
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = CosCyan,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                 )
-                                Surface(
-                                    shape = RoundedCornerShape(999.dp),
-                                    color = accent.copy(alpha = 0.16f),
+                            }
+                        }
+                    }
+                }
+
+                // Vault Note References (clickable Perlite links on delllap)
+                if (briefing.vaultRefs.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        briefing.vaultRefs.forEach { ref ->
+                            Surface(
+                                onClick = { onOpenUrl(ref.perliteUrl) },
+                                shape = RoundedCornerShape(999.dp),
+                                color = Color(0xFFA855F7).copy(alpha = 0.14f),
+                                border = BorderStroke(1.dp, Color(0xFFA855F7).copy(alpha = 0.45f)),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
                                 ) {
-                                    Text(
-                                        text = item.urgency.label,
-                                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = FontWeight.Bold,
-                                        color = accent,
-                                    )
-                                }
-                            }
-                            Surface(
-                                onClick = { onJumpToSession(item.session) },
-                                shape = CircleShape,
-                                color = Color(0xFF2563EB),
-                            ) {
-                                Box(modifier = Modifier.size(28.dp), contentAlignment = Alignment.Center) {
                                     Icon(
-                                        Icons.AutoMirrored.Filled.ArrowForward,
-                                        contentDescription = "Jump to ${item.session}",
-                                        tint = Color.White,
-                                        modifier = Modifier.size(15.dp),
+                                        Icons.Default.Description,
+                                        contentDescription = null,
+                                        tint = Color(0xFFC084FC),
+                                        modifier = Modifier.size(12.dp),
                                     )
-                                }
-                            }
-                        }
-
-                        if (item.summary.isNotBlank()) {
-                            Text(
-                                text = item.summary,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFFCBD5E1),
-                            )
-                        }
-
-                        if (!item.decisionNeeded.isNullOrBlank()) {
-                            Surface(
-                                shape = RoundedCornerShape(10.dp),
-                                color = accent.copy(alpha = 0.1f),
-                                border = BorderStroke(1.dp, accent.copy(alpha = 0.35f)),
-                            ) {
-                                Text(
-                                    text = "Decision: ${item.decisionNeeded}",
-                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    fontWeight = FontWeight.Medium,
-                                    color = Color.White,
-                                )
-                            }
-                        }
-
-                        if (item.suggestedActions.isNotEmpty()) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            ) {
-                                item.suggestedActions.forEach { action ->
-                                    CosActionChip(
-                                        action = action,
-                                        completed = action.id in completedActionIds,
-                                        onClick = { onActionClick(action) },
+                                    Text(
+                                        text = ref.title,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color(0xFFE9D5FF),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
                                     )
                                 }
                             }
                         }
                     }
                 }
-            }
-        }
-    }
-}
 
-@Composable
-private fun CosActionChip(
-    action: CosAction,
-    completed: Boolean,
-    onClick: () -> Unit,
-) {
-    val chipColor = when {
-        completed -> CosGreen
-        action.actionType == CosActionType.KILL_TMUX -> CosRed
-        action.actionType == CosActionType.START_TMUX -> CosCyan
-        action.requiresPermissionDialog -> CosAmber
-        else -> CosCyan
-    }
-    Surface(
-        onClick = onClick,
-        shape = RoundedCornerShape(999.dp),
-        color = chipColor.copy(alpha = if (completed) 0.22f else 0.14f),
-        border = BorderStroke(1.dp, chipColor.copy(alpha = 0.55f)),
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
-        ) {
-            val icon = when {
-                completed -> Icons.Default.Check
-                action.actionType == CosActionType.START_TMUX -> Icons.Default.Add
-                action.actionType == CosActionType.KILL_TMUX -> Icons.Default.Close
-                action.requiresPermissionDialog -> Icons.Default.Warning
-                else -> Icons.AutoMirrored.Filled.Send
+                // ONE Unified Suggested Actions Card (ONLY for proactive suggestions; collapses cleanly once run!)
+                val plan = briefing.actionPlan
+                if (plan.isNotEmpty()) {
+                    val remaining = plan.filter { it.id !in completedActionIds }
+                    if (remaining.isEmpty()) {
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = CosGreen.copy(alpha = 0.14f),
+                            border = BorderStroke(1.dp, CosGreen.copy(alpha = 0.4f)),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Icon(Icons.Default.Check, contentDescription = null, tint = CosGreen, modifier = Modifier.size(14.dp))
+                                Text(
+                                    text = "Ran ${plan.size} suggested action${if (plan.size == 1) "" else "s"} (${plan.joinToString(", ") { it.session }})",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = CosGreen,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    } else {
+                        val selectedToRun = remaining.filter { deselectedActionIds[it.id] != true }
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = Color(0xFF0E1420),
+                            border = BorderStroke(1.dp, CosCyan.copy(alpha = 0.35f)),
+                        ) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth().padding(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(7.dp),
+                            ) {
+                                Text(
+                                    text = if (remaining.size == 1) "SUGGESTED ACTION" else "SUGGESTED ACTIONS (${remaining.size})",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = CosCyan,
+                                )
+                                remaining.forEach { action ->
+                                    val checked = deselectedActionIds[action.id] != true
+                                    val accent = when (action.actionType) {
+                                        CosActionType.KILL_TMUX -> CosRed
+                                        CosActionType.START_TMUX, CosActionType.RENAME_TMUX -> CosCyan
+                                        CosActionType.SEND -> if (action.requiresPermissionDialog) CosAmber else CosCyan
+                                    }
+                                    val vendor = knownByName[action.session.lowercase()]?.detectedVendor
+                                        ?: AiVendor.detectFromName(action.session, isTmux = true)
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .clickable { onToggleActionSelected(action.id) }
+                                            .background(if (checked) Color(0xFF151C2C) else Color(0xFF0B0F18))
+                                            .padding(horizontal = 8.dp, vertical = 7.dp),
+                                        verticalAlignment = Alignment.Top,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    ) {
+                                        Surface(
+                                            shape = CircleShape,
+                                            color = if (checked) accent.copy(alpha = 0.25f) else Color.Transparent,
+                                            border = BorderStroke(1.2.dp, if (checked) accent else CosMuted.copy(alpha = 0.5f)),
+                                            modifier = Modifier.padding(top = 2.dp).size(18.dp),
+                                        ) {
+                                            if (checked) {
+                                                Box(contentAlignment = Alignment.Center) {
+                                                    Icon(Icons.Default.Check, contentDescription = null, tint = accent, modifier = Modifier.size(12.dp))
+                                                }
+                                            }
+                                        }
+                                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                            ) {
+                                                AiVendorLogo(vendor = vendor, size = 15.dp)
+                                                Text(
+                                                    text = "${action.session} · ${action.label}",
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    color = if (checked) Color.White else CosMuted,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                )
+                                            }
+                                            val preview = when (action.actionType) {
+                                                CosActionType.SEND -> action.sendText
+                                                CosActionType.START_TMUX -> action.command.ifBlank { "Start shell session" }
+                                                CosActionType.KILL_TMUX -> "Terminate session '${action.session}'"
+                                                CosActionType.RENAME_TMUX -> "Rename '${action.session}' to '${action.newName.ifBlank { action.command }}'"
+                                            }
+                                            Text(
+                                                text = preview,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = CosMuted,
+                                                maxLines = 3,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                    }
+                                }
+                                Button(
+                                    onClick = { onRunBatch(selectedToRun) },
+                                    enabled = selectedToRun.isNotEmpty() && !isExecutingBatch,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = CosCyan, contentColor = Color(0xFF04101B)),
+                                ) {
+                                    if (isExecutingBatch) {
+                                        CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = Color(0xFF04101B))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("Running…", fontWeight = FontWeight.Bold)
+                                    } else {
+                                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(15.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(
+                                            text = if (selectedToRun.size == 1) {
+                                                val one = selectedToRun.first()
+                                                when (one.actionType) {
+                                                    CosActionType.SEND -> "Send to ${one.session}"
+                                                    CosActionType.START_TMUX -> "Start ${one.session}"
+                                                    CosActionType.KILL_TMUX -> "End ${one.session}"
+                                                    CosActionType.RENAME_TMUX -> "Rename ${one.session}"
+                                                }
+                                            } else {
+                                                "Run Selected (${selectedToRun.size})"
+                                            },
+                                            fontWeight = FontWeight.Bold,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                Text(
+                    text = message.text,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color.White,
+                )
             }
-            Icon(icon, contentDescription = null, tint = chipColor, modifier = Modifier.size(13.dp))
-            Text(
-                text = if (completed) "${action.label} ✓" else action.label,
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.SemiBold,
-                color = Color.White,
-            )
         }
     }
 }

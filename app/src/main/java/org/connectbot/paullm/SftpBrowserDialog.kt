@@ -8,7 +8,9 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -21,6 +23,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -63,6 +66,8 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -76,22 +81,140 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.connectbot.service.TerminalBridge
 import org.connectbot.sshlib.SftpAttributes
 import org.connectbot.sshlib.SftpClient
 import org.connectbot.sshlib.SftpDirectoryEntry
+import org.connectbot.sshlib.SftpFileHandle
 import org.connectbot.sshlib.SftpOpenFlag
 import org.connectbot.sshlib.SftpResult
+import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.OutputStream
 import java.util.Locale
 
 private const val MAX_PREVIEW_BYTES = 256 * 1024
-private const val TRANSFER_CHUNK_BYTES = 32 * 1024
+private const val TRANSFER_CHUNK_BYTES = 64 * 1024
+private const val SFTP_PIPELINE_DEPTH = 16
+
+private data class QueuedSftpRead(
+    val offset: Long,
+    val length: Int,
+    val deferred: Deferred<SftpResult<ByteArray?>>,
+)
+
+/**
+ * Pipelined SFTP download keeping up to [SFTP_PIPELINE_DEPTH] 64 KiB reads in flight simultaneously
+ * over cbssh's multiplexed SftpDispatcher while writing chunks strictly in order and filling any
+ * server-side short reads cleanly.
+ */
+private suspend fun pipelinedSftpDownload(
+    client: SftpClient,
+    handle: SftpFileHandle,
+    knownSize: Long,
+    rawOut: OutputStream,
+    onProgress: (Float) -> Unit,
+) = coroutineScope {
+    val totalSize = if (knownSize > 0L) {
+        knownSize
+    } else {
+        (client.fstat(handle) as? SftpResult.Success)?.value?.size ?: -1L
+    }
+    val out = BufferedOutputStream(rawOut, 256 * 1024)
+    val queue = ArrayDeque<QueuedSftpRead>(SFTP_PIPELINE_DEPTH)
+    var nextRequestOffset = 0L
+    var writtenBytes = 0L
+    var lastReportedBytes = 0L
+    var chunkBytes = TRANSFER_CHUNK_BYTES
+
+    fun enqueueUpToLimit() {
+        while (queue.size < SFTP_PIPELINE_DEPTH) {
+            if (totalSize > 0L && nextRequestOffset >= totalSize) break
+            val reqLen = if (totalSize > 0L) {
+                minOf(chunkBytes.toLong(), totalSize - nextRequestOffset).toInt()
+            } else {
+                chunkBytes
+            }
+            if (reqLen <= 0) break
+            val reqOffset = nextRequestOffset
+            nextRequestOffset += reqLen
+            queue.addLast(
+                QueuedSftpRead(
+                    offset = reqOffset,
+                    length = reqLen,
+                    deferred = async { client.read(handle, reqOffset, reqLen) },
+                ),
+            )
+        }
+    }
+
+    try {
+        enqueueUpToLimit()
+        while (queue.isNotEmpty()) {
+            val head = queue.removeFirst()
+            val bytes = when (val res = head.deferred.await()) {
+                is SftpResult.Success -> res.value
+                else -> error("Read failed: ${res.errorText()}")
+            }
+            if (bytes == null || bytes.isEmpty()) {
+                queue.forEach { it.deferred.cancel() }
+                queue.clear()
+                break
+            }
+            out.write(bytes)
+            writtenBytes += bytes.size
+
+            // If server capped this read shorter than requested before EOF, fill the exact gap
+            // synchronously and adapt future chunk size so subsequent reads stay aligned.
+            if (bytes.size < head.length) {
+                if (bytes.size in 4096 until chunkBytes) {
+                    chunkBytes = bytes.size
+                }
+                var subOffset = head.offset + bytes.size
+                val endOffset = head.offset + head.length
+                var hitEof = false
+                while (subOffset < endOffset) {
+                    val rem = (endOffset - subOffset).toInt()
+                    val subBytes = when (val subRes = client.read(handle, subOffset, rem)) {
+                        is SftpResult.Success -> subRes.value
+                        else -> error("Read failed: ${subRes.errorText()}")
+                    }
+                    if (subBytes == null || subBytes.isEmpty()) {
+                        hitEof = true
+                        break
+                    }
+                    out.write(subBytes)
+                    subOffset += subBytes.size
+                    writtenBytes += subBytes.size
+                }
+                if (hitEof) {
+                    queue.forEach { it.deferred.cancel() }
+                    queue.clear()
+                    break
+                }
+            }
+
+            if (totalSize > 0L && (writtenBytes - lastReportedBytes >= 256 * 1024 || writtenBytes >= totalSize)) {
+                lastReportedBytes = writtenBytes
+                onProgress((writtenBytes.toFloat() / totalSize.toFloat()).coerceIn(0f, 1f))
+            }
+            enqueueUpToLimit()
+        }
+        out.flush()
+        if (totalSize > 0L) onProgress(1f)
+    } catch (t: Throwable) {
+        queue.forEach { it.deferred.cancel() }
+        throw t
+    }
+}
 
 private data class RemoteItem(
     val name: String,
@@ -147,6 +270,13 @@ private fun queryDisplayName(context: Context, uri: Uri): String {
     return uri.lastPathSegment?.substringAfterLast('/')?.ifBlank { "upload.bin" } ?: "upload.bin"
 }
 
+private fun parentRemotePath(path: String): String {
+    if (path.isBlank() || path == "/" || path == ".") return "/"
+    val trimmed = path.trimEnd('/')
+    val parent = trimmed.substringBeforeLast('/')
+    return if (parent.isEmpty()) "/" else parent
+}
+
 private fun <T> SftpResult<T>.errorText(): String = when (this) {
     is SftpResult.Success -> ""
     is SftpResult.ServerError -> message.ifBlank { statusCode.name }
@@ -154,10 +284,64 @@ private fun <T> SftpResult<T>.errorText(): String = when (this) {
     is SftpResult.IoError -> cause.message ?: cause.javaClass.simpleName
 }
 
+@Composable
+private fun SftpPathBar(
+    path: String,
+    onOpen: (String) -> Unit,
+) {
+    val scroll = rememberScrollState()
+    LaunchedEffect(path, scroll.maxValue) {
+        scroll.scrollTo(scroll.maxValue)
+    }
+    val segments = if (path.isBlank() || path == "." || path == "/") {
+        emptyList()
+    } else {
+        val names = path.trimEnd('/').split('/').filter { it.isNotEmpty() }
+        var accumulated = ""
+        names.map { name ->
+            accumulated += "/$name"
+            name to accumulated
+        }
+    }
+    Row(
+        modifier = Modifier.horizontalScroll(scroll),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        val atRoot = path == "/"
+        Text(
+            text = "/",
+            modifier = Modifier.clickable(enabled = !atRoot && path != ".") { onOpen("/") },
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            color = if (atRoot) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+        )
+        segments.forEachIndexed { index, (label, target) ->
+            if (index > 0) {
+                Text(
+                    "/",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            val current = target == path.trimEnd('/').ifEmpty { "/" }
+            Text(
+                text = label,
+                modifier = Modifier.clickable(enabled = !current) { onOpen(target) },
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                color = if (current) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SftpBrowserDialog(
     bridge: TerminalBridge,
+    startPath: String? = null,
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -185,28 +369,86 @@ fun SftpBrowserDialog(
     var deleteTarget by remember { mutableStateOf<RemoteItem?>(null) }
     var pendingDownloadTarget by remember { mutableStateOf<RemoteItem?>(null) }
     var pendingUpload by remember { mutableStateOf<PendingUpload?>(null) }
+    var highlightName by remember { mutableStateOf<String?>(null) }
+    var refreshing by remember { mutableStateOf(false) }
+    var scrollGeneration by remember { mutableIntStateOf(0) }
+    var pendingScroll by remember { mutableStateOf(0 to 0) }
+    val listState = rememberLazyListState()
+    val history = remember { mutableStateListOf<String>() }
 
-    suspend fun loadDir(client: SftpClient, targetPath: String) {
-        loading = true
+    fun captureScroll() {
+        val path = currentPath
+        if (path.isBlank() || path == ".") return
+        bridge.rememberSftpScroll(path, listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset)
+    }
+
+    fun showDirectory(path: String, raw: List<SftpDirectoryEntry>, highlight: String?, scroll: Pair<Int, Int>) {
+        val mapped = raw
+            .filter { it.filename != "." && it.filename != ".." }
+            .map { it.toRemoteItem(path) }
+            .sortedWith(compareByDescending<RemoteItem> { it.isDir }.thenBy { it.name.lowercase() })
+        currentPath = path
+        highlightName = highlight
+        entries = mapped
+        bridge.rememberSftpDirectory(path)
+        val shown = mapped.filter { showHidden || !it.name.startsWith(".") || it.name == highlight }
+        val index = when {
+            highlight != null -> shown.indexOfFirst { it.name == highlight }.coerceAtLeast(0)
+            else -> scroll.first
+        }
+        pendingScroll = index to scroll.second
+        scrollGeneration += 1
+        loading = false
+        refreshing = false
+    }
+
+    suspend fun loadDir(client: SftpClient, targetPath: String, pushHistory: Boolean = true) {
+        val leaving = currentPath
+        val captured = listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+        if (pushHistory && leaving.isNotBlank() && leaving != "." && leaving != targetPath) {
+            bridge.rememberSftpScroll(leaving, captured.first, captured.second)
+            if (history.lastOrNull() != leaving) {
+                history.add(leaving)
+                if (history.size > 40) history.removeAt(0)
+            }
+        }
+        if (entries.isEmpty()) loading = true else refreshing = true
         errorBanner = null
+        statusBanner = null
         val resolved = when (val rp = client.realpath(targetPath)) {
             is SftpResult.Success -> rp.value
             else -> targetPath
         }
         when (val res = client.listdir(resolved)) {
             is SftpResult.Success -> {
-                currentPath = resolved
-                entries = res.value
-                    .filter { it.filename != "." && it.filename != ".." }
-                    .map { it.toRemoteItem(resolved) }
-                    .sortedWith(compareByDescending<RemoteItem> { it.isDir }.thenBy { it.name.lowercase() })
+                val scroll = if (resolved == leaving) captured else bridge.sftpScrollFor(resolved)
+                showDirectory(resolved, res.value, highlight = null, scroll = scroll)
             }
 
             else -> {
-                errorBanner = "Cannot open $resolved: ${res.errorText()}"
+                val parent = parentRemotePath(resolved)
+                val name = resolved.trimEnd('/').substringAfterLast('/').takeIf { it.isNotEmpty() && parent != resolved }
+                val parentRes = if (name != null) client.listdir(parent) else null
+                if (name != null && parentRes is SftpResult.Success) {
+                    showDirectory(parent, parentRes.value, highlight = name, scroll = 0 to 0)
+                    statusBanner = "Opened the folder containing $name"
+                } else {
+                    errorBanner = "Cannot open $resolved: ${res.errorText()}"
+                    loading = false
+                    refreshing = false
+                }
             }
         }
-        loading = false
+    }
+
+    fun goBack() {
+        val previous = if (history.isNotEmpty()) history.removeAt(history.lastIndex) else null
+        val client = sftpClient
+        if (previous != null && client != null) {
+            scope.launch { loadDir(client, previous, pushHistory = false) }
+        } else {
+            onDismiss()
+        }
     }
 
     LaunchedEffect(bridge) {
@@ -221,7 +463,8 @@ fun SftpBrowserDialog(
                     else -> "/"
                 }
                 homePath = resolvedHome
-                loadDir(client, resolvedHome)
+                val requested = startPath?.takeIf { it.isNotBlank() } ?: bridge.sftpDirectory ?: resolvedHome
+                loadDir(client, requested, pushHistory = false)
             }
 
             else -> {
@@ -233,6 +476,7 @@ fun SftpBrowserDialog(
 
     DisposableEffect(Unit) {
         onDispose {
+            captureScroll()
             activeTransferJob?.cancel()
             runCatching { sftpClient?.close() }
         }
@@ -324,22 +568,13 @@ fun SftpBrowserDialog(
                     }
                     try {
                         context.contentResolver.openOutputStream(uri)?.use { out ->
-                            var offset = 0L
-                            while (true) {
-                                when (val rRes = client.read(handle, offset, TRANSFER_CHUNK_BYTES)) {
-                                    is SftpResult.Success -> {
-                                        val bytes = rRes.value ?: break
-                                        if (bytes.isEmpty()) break
-                                        out.write(bytes)
-                                        offset += bytes.size
-                                        if (target.size > 0) {
-                                            transferProgress = (offset.toFloat() / target.size.toFloat()).coerceIn(0f, 1f)
-                                        }
-                                    }
-
-                                    else -> error("Read failed: ${rRes.errorText()}")
-                                }
-                            }
+                            pipelinedSftpDownload(
+                                client = client,
+                                handle = handle,
+                                knownSize = target.size,
+                                rawOut = out,
+                                onProgress = { progress -> transferProgress = progress },
+                            )
                         } ?: error("Cannot write destination file")
                     } finally {
                         client.close(handle)
@@ -419,22 +654,13 @@ fun SftpBrowserDialog(
                     }
                     try {
                         dest.outputStream().use { out ->
-                            var offset = 0L
-                            while (true) {
-                                when (val rRes = client.read(handle, offset, TRANSFER_CHUNK_BYTES)) {
-                                    is SftpResult.Success -> {
-                                        val bytes = rRes.value ?: break
-                                        if (bytes.isEmpty()) break
-                                        out.write(bytes)
-                                        offset += bytes.size
-                                        if (item.size > 0) {
-                                            transferProgress = (offset.toFloat() / item.size.toFloat()).coerceIn(0f, 1f)
-                                        }
-                                    }
-
-                                    else -> error(rRes.errorText())
-                                }
-                            }
+                            pipelinedSftpDownload(
+                                client = client,
+                                handle = handle,
+                                knownSize = item.size,
+                                rawOut = out,
+                                onProgress = { progress -> transferProgress = progress },
+                            )
                         }
                     } finally {
                         client.close(handle)
@@ -464,12 +690,24 @@ fun SftpBrowserDialog(
         }
     }
 
-    val visibleEntries = remember(entries, showHidden) {
-        if (showHidden) entries else entries.filterNot { it.name.startsWith(".") }
+    val visibleEntries = remember(entries, showHidden, highlightName) {
+        if (showHidden) {
+            entries
+        } else {
+            entries.filter { !it.name.startsWith(".") || it.name == highlightName }
+        }
+    }
+
+    LaunchedEffect(scrollGeneration, visibleEntries) {
+        if (scrollGeneration == 0 || visibleEntries.isEmpty()) return@LaunchedEffect
+        val (index, offset) = pendingScroll
+        runCatching {
+            listState.scrollToItem(index.coerceIn(0, visibleEntries.lastIndex), offset.coerceAtLeast(0))
+        }
     }
 
     Dialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { goBack() },
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
         Scaffold(
@@ -478,12 +716,12 @@ fun SftpBrowserDialog(
                     title = {
                         Column {
                             Text("SFTP Files", style = MaterialTheme.typography.titleMedium)
-                            Text(
-                                currentPath,
-                                style = MaterialTheme.typography.bodySmall,
-                                fontFamily = FontFamily.Monospace,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
+                            SftpPathBar(
+                                path = currentPath,
+                                onOpen = { target ->
+                                    val client = sftpClient ?: return@SftpPathBar
+                                    scope.launch { loadDir(client, target) }
+                                },
                             )
                         }
                     },
@@ -496,10 +734,9 @@ fun SftpBrowserDialog(
                         IconButton(
                             onClick = {
                                 val client = sftpClient ?: return@IconButton
-                                val parent = currentPath.substringBeforeLast('/').ifEmpty { "/" }
-                                scope.launch { loadDir(client, parent) }
+                                scope.launch { loadDir(client, parentRemotePath(currentPath)) }
                             },
-                            enabled = sftpClient != null && currentPath != "/",
+                            enabled = sftpClient != null && currentPath != "/" && currentPath != ".",
                         ) {
                             Icon(Icons.Default.ArrowUpward, contentDescription = "Parent folder")
                         }
@@ -593,7 +830,11 @@ fun SftpBrowserDialog(
                     )
                 }
 
-                if (loading) {
+                if (refreshing) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+
+                if (loading && entries.isEmpty()) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -610,7 +851,7 @@ fun SftpBrowserDialog(
                         modifier = Modifier.padding(24.dp),
                     )
                 } else {
-                    LazyColumn(modifier = Modifier.fillMaxSize()) {
+                    LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                         items(visibleEntries, key = { it.fullPath }) { item ->
                             ListItem(
                                 headlineContent = {
@@ -644,14 +885,22 @@ fun SftpBrowserDialog(
                                         Text("Actions")
                                     }
                                 },
-                                modifier = Modifier.clickable {
-                                    if (item.isDir) {
-                                        val client = sftpClient ?: return@clickable
-                                        scope.launch { loadDir(client, item.fullPath) }
-                                    } else {
-                                        selectedItem = item
-                                    }
-                                },
+                                modifier = Modifier
+                                    .background(
+                                        if (item.name == highlightName) {
+                                            MaterialTheme.colorScheme.secondaryContainer
+                                        } else {
+                                            MaterialTheme.colorScheme.surface
+                                        },
+                                    )
+                                    .clickable {
+                                        if (item.isDir) {
+                                            val client = sftpClient ?: return@clickable
+                                            scope.launch { loadDir(client, item.fullPath) }
+                                        } else {
+                                            selectedItem = item
+                                        }
+                                    },
                             )
                             HorizontalDivider()
                         }

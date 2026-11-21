@@ -79,6 +79,7 @@ import org.connectbot.sshlib.SftpResult
 import org.connectbot.transport.AbsTransport
 import org.connectbot.transport.TransportFactory
 import org.connectbot.util.HostConstants
+import org.connectbot.util.RemotePath
 import org.connectbot.util.PreferenceConstants
 import org.connectbot.util.TerminalFontWeight
 import org.connectbot.util.TerminalKeyModifiers
@@ -426,7 +427,8 @@ class TerminalBridge {
 
     val sessionUuid: UUID = UUID.randomUUID()
 
-    val tmuxSessionName: String?
+    var tmuxSessionName: String?
+        private set
 
     val terminalModeTracker = TerminalModeTracker()
 
@@ -1057,6 +1059,40 @@ class TerminalBridge {
                 }
             },
         )
+    }
+
+    /** Send one named key with an explicit modifier mask. Used for Shift+Left / Shift+Right, which hardware keyboards drop. */
+    fun sendModifiedKey(target: String, modifiers: Int) {
+        val connection = captureInputConnection()
+        keyHandler.clearTransients()
+        configuredInputProcessor
+        configuredInputs.trySend(ConfiguredInput(connection, key = target, modifiers = modifiers))
+    }
+
+    fun updateTmuxSessionName(name: String) {
+        tmuxSessionName = name
+    }
+
+    /** Last directory this session's SFTP screen was showing. Survives closing the screen. */
+    var sftpDirectory: String? = null
+        private set
+
+    private val sftpScroll = HashMap<String, Pair<Int, Int>>()
+
+    fun rememberSftpDirectory(path: String) {
+        if (path.isNotBlank()) sftpDirectory = path
+    }
+
+    fun rememberSftpScroll(path: String, index: Int, offset: Int) {
+        if (path.isBlank()) return
+        sftpScroll[path] = index.coerceAtLeast(0) to offset.coerceAtLeast(0)
+    }
+
+    fun sftpScrollFor(path: String): Pair<Int, Int> = sftpScroll[path] ?: (0 to 0)
+
+    fun scanForPaths(): List<String> {
+        val output = runCatching { terminalEmulator.getLastCommandOutput() }.getOrNull().orEmpty()
+        return RemotePath.findAll(output)
     }
 
     /** Called from UI: capture/consume transient modifiers before another tap can change them. */

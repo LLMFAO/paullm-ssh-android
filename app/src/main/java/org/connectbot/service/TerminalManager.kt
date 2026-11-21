@@ -556,6 +556,23 @@ class TerminalManager :
         return bridge
     }
 
+    /** Keep an already-open tab label in sync after `tmux rename-session`. */
+    fun renameOpenTmuxSession(host: Host, oldName: String, newName: String) {
+        if (oldName.isBlank() || newName.isBlank() || oldName == newName) return
+        synchronized(_bridges) {
+            var changed = false
+            for (bridge in _bridges) {
+                if (bridge.host.id == host.id && bridge.tmuxSessionName == oldName) {
+                    bridge.updateTmuxSessionName(newName)
+                    changed = true
+                }
+            }
+            if (changed) {
+                _bridgesFlow.value = _bridges.toList()
+            }
+        }
+    }
+
     /**
      * Opens an additional independent shell tab on the same host.
      */
