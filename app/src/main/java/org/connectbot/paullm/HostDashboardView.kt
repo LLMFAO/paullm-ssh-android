@@ -256,7 +256,11 @@ fun HostDashboardView(
     disconnected: Boolean,
     openTmuxNames: Set<String>,
     sessions: List<TmuxSessionInfo>,
+    latestBriefing: CosBriefingPayload?,
+    cosRunning: Boolean,
     onSessionsUpdated: (List<TmuxSessionInfo>) -> Unit,
+    onOpenBriefing: () -> Unit,
+    onRunBriefingNow: () -> Unit,
     onAttachTmuxSession: (String) -> Unit,
     onDetachTmuxSession: (String) -> Unit,
     onOpenNewSessionPicker: () -> Unit,
@@ -408,6 +412,17 @@ fun HostDashboardView(
                     }
                 }
             }
+        }
+
+        // 1b. Chief of Staff Summary Card (on-demand remote orchestrator)
+        item(key = "cos_summary") {
+            ChiefOfStaffDashboardCard(
+                latestBriefing = latestBriefing,
+                isBusy = cosRunning,
+                sessionCount = sessions.size,
+                onOpenBriefing = onOpenBriefing,
+                onRunBriefingNow = onRunBriefingNow,
+            )
         }
 
         // 2. tmux Sessions Card (with LobeHub logos + Blue Attach -> + Red x Kill/Detach)

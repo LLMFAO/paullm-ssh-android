@@ -62,6 +62,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Build
@@ -167,7 +168,12 @@ import org.connectbot.R
 import org.connectbot.data.entity.Host
 import org.connectbot.paullm.AiVendor
 import org.connectbot.paullm.AiVendorLogo
+import org.connectbot.paullm.ChiefOfStaffChatView
+import org.connectbot.paullm.ChiefOfStaffEngine
 import org.connectbot.paullm.ComposeDraftStore
+import org.connectbot.paullm.CosBackend
+import org.connectbot.paullm.CosBriefingPayload
+import org.connectbot.paullm.CosChatMessage
 import org.connectbot.paullm.HostDashboardView
 import org.connectbot.paullm.PaullmComposeBar
 import org.connectbot.paullm.PaullmShell
@@ -911,9 +917,51 @@ fun ConsoleScreen(
     var showToolkitSheet by remember(currentBridgeId) { mutableStateOf(false) }
     var showStatsSheet by remember(currentBridgeId) { mutableStateOf(false) }
     var showPresetsSheet by remember(currentBridgeId) { mutableStateOf(false) }
-    var showDashboardPane by rememberSaveable(currentBridge?.host?.id) { mutableStateOf(false) }
+    var activePaneName by rememberSaveable(currentBridge?.host?.id) { mutableStateOf("TERMINAL") }
+    val showDashboardPane = activePaneName == "DASHBOARD"
+    val showBriefingPane = activePaneName == "BRIEFING"
     var autoLandedDashboardForHost by rememberSaveable(currentBridge?.host?.id) { mutableStateOf(false) }
     var remoteTmuxSessions by remember(currentBridge?.host?.id) { mutableStateOf<List<TmuxSessionInfo>>(emptyList()) }
+    var cosMessages by remember(currentBridge?.host?.id) { mutableStateOf<List<CosChatMessage>>(emptyList()) }
+    var cosLatestBriefing by remember(currentBridge?.host?.id) { mutableStateOf<CosBriefingPayload?>(null) }
+    var cosConversationId by remember(currentBridge?.host?.id) { mutableStateOf<String?>(null) }
+    var cosBackend by remember(currentBridge?.host?.id) { mutableStateOf(CosBackend.AUTO) }
+    var cosRunning by remember(currentBridge?.host?.id) { mutableStateOf(false) }
+
+    fun triggerCosPrompt(bridge: TerminalBridge, promptText: String) {
+        if (cosRunning || bridge.isDisconnected || !bridge.supportsRemoteTools()) return
+        val historySnapshot = cosMessages
+        cosMessages = cosMessages + CosChatMessage(isUser = true, text = promptText)
+        cosRunning = true
+        coroutineScope.launch {
+            val res = ChiefOfStaffEngine.runTurn(
+                bridge = bridge,
+                prompt = promptText,
+                backend = cosBackend,
+                conversationId = cosConversationId,
+                recentHistory = historySnapshot,
+                knownSessions = remoteTmuxSessions,
+            )
+            res.onSuccess { payload ->
+                cosLatestBriefing = payload
+                if (!payload.conversationId.isNullOrBlank()) {
+                    cosConversationId = payload.conversationId
+                }
+                cosMessages = cosMessages + CosChatMessage(
+                    isUser = false,
+                    text = payload.headline,
+                    briefing = payload,
+                )
+            }.onFailure { err ->
+                cosMessages = cosMessages + CosChatMessage(
+                    isUser = false,
+                    text = "",
+                    error = err.message ?: "Chief of Staff request failed",
+                )
+            }
+            cosRunning = false
+        }
+    }
 
     val activeBridgeReadyForTmux = currentBridge?.supportsRemoteTools() == true && currentBridge.isSessionOpen
     LaunchedEffect(currentBridge?.host?.id, activeBridgeReadyForTmux, uiState.bridges.size) {
@@ -921,7 +969,7 @@ fun ConsoleScreen(
         if (bridge.supportsRemoteTools() && bridge.isSessionOpen) {
             if (!autoLandedDashboardForHost && bridge.tmuxSessionName == null) {
                 autoLandedDashboardForHost = true
-                showDashboardPane = true
+                activePaneName = "DASHBOARD"
                 showSoftwareKeyboard = false
                 keyboardController?.hide()
             }
@@ -1349,9 +1397,25 @@ fun ConsoleScreen(
                             disconnected = disconnected,
                             openTmuxNames = openTmuxForDash,
                             sessions = remoteTmuxSessions,
+                            latestBriefing = cosLatestBriefing,
+                            cosRunning = cosRunning,
                             onSessionsUpdated = { remoteTmuxSessions = it },
+                            onOpenBriefing = {
+                                activePaneName = "BRIEFING"
+                                showSoftwareKeyboard = false
+                                keyboardController?.hide()
+                            },
+                            onRunBriefingNow = {
+                                activePaneName = "BRIEFING"
+                                showSoftwareKeyboard = false
+                                keyboardController?.hide()
+                                triggerCosPrompt(
+                                    activeBridge,
+                                    "Give me an executive Chief of Staff briefing across all tmux sessions. Bubble up decisions and blockers first.",
+                                )
+                            },
                             onAttachTmuxSession = { sessionName ->
-                                showDashboardPane = false
+                                activePaneName = "TERMINAL"
                                 viewModel.openOrSwitchTmuxTab(activeBridge.host, sessionName)
                             },
                             onDetachTmuxSession = { sessionName ->
@@ -1370,8 +1434,42 @@ fun ConsoleScreen(
                                 showDisconnectDialog = true
                             },
                             onReconnectHost = {
-                                showDashboardPane = false
+                                activePaneName = "TERMINAL"
                                 viewModel.reconnect(activeBridge)
+                            },
+                            onMessage = { msg ->
+                                coroutineScope.launch { snackbarHostState.showSnackbar(msg) }
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f),
+                        )
+                    } else if (showBriefingPane && activeBridge.supportsRemoteTools()) {
+                        ChiefOfStaffChatView(
+                            bridge = activeBridge,
+                            disconnected = disconnected,
+                            knownSessions = remoteTmuxSessions,
+                            messages = cosMessages,
+                            selectedBackend = cosBackend,
+                            isRunning = cosRunning,
+                            onSelectBackend = { cosBackend = it },
+                            onSendPrompt = { promptText -> triggerCosPrompt(activeBridge, promptText) },
+                            onClearChat = {
+                                cosMessages = emptyList()
+                                cosLatestBriefing = null
+                                cosConversationId = null
+                            },
+                            onJumpToSession = { sessionName ->
+                                activePaneName = "TERMINAL"
+                                viewModel.openOrSwitchTmuxTab(activeBridge.host, sessionName)
+                            },
+                            onSessionsChanged = {
+                                coroutineScope.launch {
+                                    runCatching { TmuxRemoteController.discover(activeBridge) }
+                                        .onSuccess { (installed, list) ->
+                                            if (installed) remoteTmuxSessions = list
+                                        }
+                                }
                             },
                             onMessage = { msg ->
                                 coroutineScope.launch { snackbarHostState.showSnackbar(msg) }
@@ -1645,11 +1743,11 @@ fun ConsoleScreen(
                 bridge = currentBridge,
                 openTmuxNames = openTmuxNames,
                 onOpenTmuxTab = { sessionName ->
-                    showDashboardPane = false
+                    activePaneName = "TERMINAL"
                     viewModel.openOrSwitchTmuxTab(currentBridge.host, sessionName)
                 },
                 onOpenNewShellTab = {
-                    showDashboardPane = false
+                    activePaneName = "TERMINAL"
                     viewModel.openNewShellTab(currentBridge.host)
                 },
                 onDetachCurrentTab = {
@@ -1682,7 +1780,7 @@ fun ConsoleScreen(
             ToolkitSheet(
                 bridge = currentBridge,
                 onOpenTmuxTab = { sessionName ->
-                    showDashboardPane = false
+                    activePaneName = "TERMINAL"
                     viewModel.openOrSwitchTmuxTab(currentBridge.host, sessionName)
                 },
                 onDismiss = {
@@ -1730,7 +1828,9 @@ fun ConsoleScreen(
             TopAppBar(
                 title = {
                     if (remoteToolsReady) {
-                        // Sleek 3-way pill switcher matching iOS paullm-ssh: Dashboard | Terminal | Files
+                        // Sleek 4-way pill switcher: Dashboard | Briefing (CoS) | Terminal | Files
+                        val isTerminalPane = !showDashboardPane && !showBriefingPane
+                        val hasCosAttention = (cosLatestBriefing?.attentionCount ?: 0) > 0
                         Surface(
                             shape = RoundedCornerShape(22.dp),
                             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.75f),
@@ -1743,7 +1843,7 @@ fun ConsoleScreen(
                             ) {
                                 Surface(
                                     onClick = {
-                                        showDashboardPane = true
+                                        activePaneName = "DASHBOARD"
                                         showSoftwareKeyboard = false
                                         keyboardController?.hide()
                                     },
@@ -1755,7 +1855,7 @@ fun ConsoleScreen(
                                     },
                                 ) {
                                     Box(
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         Icon(
@@ -1772,25 +1872,54 @@ fun ConsoleScreen(
                                 }
                                 Surface(
                                     onClick = {
-                                        showDashboardPane = false
-                                        termFocusRequester.requestFocus()
+                                        activePaneName = "BRIEFING"
+                                        showSoftwareKeyboard = false
+                                        keyboardController?.hide()
                                     },
                                     shape = RoundedCornerShape(18.dp),
-                                    color = if (!showDashboardPane) {
+                                    color = if (showBriefingPane) {
                                         MaterialTheme.colorScheme.primaryContainer
                                     } else {
                                         androidx.compose.ui.graphics.Color.Transparent
                                     },
                                 ) {
                                     Box(
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Icon(
+                                            Icons.Default.AutoAwesome,
+                                            contentDescription = "Chief of Staff Briefing",
+                                            modifier = Modifier.size(18.dp),
+                                            tint = when {
+                                                showBriefingPane -> MaterialTheme.colorScheme.primary
+                                                hasCosAttention -> androidx.compose.ui.graphics.Color(0xFFF59E0B)
+                                                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                            },
+                                        )
+                                    }
+                                }
+                                Surface(
+                                    onClick = {
+                                        activePaneName = "TERMINAL"
+                                        termFocusRequester.requestFocus()
+                                    },
+                                    shape = RoundedCornerShape(18.dp),
+                                    color = if (isTerminalPane) {
+                                        MaterialTheme.colorScheme.primaryContainer
+                                    } else {
+                                        androidx.compose.ui.graphics.Color.Transparent
+                                    },
+                                ) {
+                                    Box(
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         Icon(
                                             Icons.Default.Terminal,
                                             contentDescription = "Terminal",
                                             modifier = Modifier.size(18.dp),
-                                            tint = if (!showDashboardPane) {
+                                            tint = if (isTerminalPane) {
                                                 MaterialTheme.colorScheme.primary
                                             } else {
                                                 MaterialTheme.colorScheme.onSurfaceVariant
@@ -1808,7 +1937,7 @@ fun ConsoleScreen(
                                     color = androidx.compose.ui.graphics.Color.Transparent,
                                 ) {
                                     Box(
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         Icon(
@@ -1864,7 +1993,7 @@ fun ConsoleScreen(
                     TopAppBarDefaults.topAppBarColors()
                 },
                 actions = {
-                    if (!showDashboardPane) {
+                    if (!showDashboardPane && !showBriefingPane) {
                         // Inline Compose + Voice bar toggle
                         IconButton(
                             onClick = { showComposeBar = !showComposeBar },
