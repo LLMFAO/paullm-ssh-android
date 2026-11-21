@@ -39,6 +39,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -68,18 +69,22 @@ enum class TmuxLaunchPreset(
     val label: String,
     val defaultName: String,
     val command: String?,
+    val yoloCommand: String?,
     val vendor: AiVendor,
 ) {
-    CLAUDE("Claude", "claude", "claude", AiVendor.CLAUDE),
-    CODEX("Codex", "codex", "codex", AiVendor.CODEX),
-    GROK("Grok", "grok", "grok", AiVendor.GROK),
-    OPENCODE("OpenCode", "opencode", "opencode", AiVendor.OPENCODE),
-    ANTIGRAVITY("Antigravity", "agy", "agy", AiVendor.ANTIGRAVITY),
-    GEMINI("Gemini", "gemini", "gemini", AiVendor.GEMINI),
-    PI("Pi", "pi", "pi", AiVendor.PI),
-    AIDER("Aider", "aider", "aider", AiVendor.AIDER),
-    GOOSE("Goose", "goose", "goose", AiVendor.GOOSE),
-    SHELL("Shell", "main", null, AiVendor.TMUX),
+    CLAUDE("Claude", "claude", "claude", "claude --dangerously-skip-permissions", AiVendor.CLAUDE),
+    CODEX("Codex", "codex", "codex", "codex --dangerously-bypass-approvals-and-sandbox", AiVendor.CODEX),
+    GROK("Grok", "grok", "grok", "grok --always-approve", AiVendor.GROK),
+    OPENCODE("OpenCode", "opencode", "opencode", "opencode --auto", AiVendor.OPENCODE),
+    ANTIGRAVITY("Antigravity", "agy", "agy", "agy --dangerously-skip-permissions", AiVendor.ANTIGRAVITY),
+    GEMINI("Gemini", "gemini", "gemini", "gemini --yolo --skip-trust", AiVendor.GEMINI),
+    PI("Pi", "pi", "pi", "pi --approve", AiVendor.PI),
+    AIDER("Aider", "aider", "aider", "aider --yes", AiVendor.AIDER),
+    GOOSE("Goose", "goose", "goose", "goose", AiVendor.GOOSE),
+    SHELL("Shell", "main", null, null, AiVendor.TMUX),
+    ;
+
+    fun resolvedCommand(yoloMode: Boolean): String? = if (yoloMode) yoloCommand ?: command else command
 }
 
 object TmuxRemoteController {
@@ -130,17 +135,20 @@ object TmuxRemoteController {
         rawName: String,
         preset: TmuxLaunchPreset,
         customCommand: String? = null,
+        yoloMode: Boolean = true,
+        workingDir: String? = null,
     ): Result<String> {
         val cleanName = rawName.trim()
             .ifEmpty { preset.defaultName }
             .replace(Regex("[^A-Za-z0-9._-]"), "-")
         val quotedName = PaullmShell.quote(cleanName)
         val exactTarget = PaullmShell.quote("=$cleanName")
-        val launchCmd = customCommand?.trim()?.takeIf { it.isNotEmpty() } ?: preset.command
+        val launchCmd = customCommand?.trim()?.takeIf { it.isNotEmpty() } ?: preset.resolvedCommand(yoloMode)
+        val dirFlag = workingDir?.trim()?.takeIf { it.isNotEmpty() && it != "~" }?.let { " -c ${PaullmShell.quote(it)}" }.orEmpty()
         val createCmd = if (launchCmd != null) {
-            "tmux new-session -d -s $quotedName ${PaullmShell.quote("$launchCmd; exec \${SHELL:-sh}")}"
+            "tmux new-session -d -s $quotedName$dirFlag ${PaullmShell.quote("$launchCmd; exec \${SHELL:-sh}")}"
         } else {
-            "tmux new-session -d -s $quotedName"
+            "tmux new-session -d -s $quotedName$dirFlag"
         }
         val body = "if ! tmux has-session -t $exactTarget 2>/dev/null; then $createCmd; fi && echo __SESSION_OK__"
         val res = bridge.execCommand(PaullmShell.wrapLoginShell(body), timeoutMs = 10_000L)
@@ -214,6 +222,8 @@ fun TmuxManagerSheet(
 
     var selectedPreset by remember { mutableStateOf(TmuxLaunchPreset.CLAUDE) }
     var newSessionName by remember { mutableStateOf(TmuxLaunchPreset.CLAUDE.defaultName) }
+    var yoloMode by remember { mutableStateOf(true) }
+    var workingDir by remember { mutableStateOf("~") }
     var customCmd by remember { mutableStateOf("") }
 
     var renameTarget by remember { mutableStateOf<TmuxSessionInfo?>(null) }
@@ -556,6 +566,30 @@ fun TmuxManagerSheet(
                     }
                 }
 
+                if (selectedPreset.command != null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("YOLO / Skip Permissions", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Medium)
+                            Text(
+                                selectedPreset.resolvedCommand(yoloMode).orEmpty(),
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        Switch(
+                            checked = yoloMode,
+                            onCheckedChange = { yoloMode = it },
+                        )
+                    }
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -568,6 +602,13 @@ fun TmuxManagerSheet(
                         label = { Text("Session name") },
                         singleLine = true,
                     )
+                    OutlinedTextField(
+                        value = workingDir,
+                        onValueChange = { workingDir = it },
+                        modifier = Modifier.weight(0.8f),
+                        label = { Text("Start dir") },
+                        singleLine = true,
+                    )
                     Button(
                         enabled = !launching,
                         onClick = {
@@ -578,6 +619,8 @@ fun TmuxManagerSheet(
                                     rawName = newSessionName,
                                     preset = selectedPreset,
                                     customCommand = customCmd,
+                                    yoloMode = yoloMode,
+                                    workingDir = workingDir,
                                 ).onSuccess { createdName ->
                                     onOpenTmuxTab(createdName)
                                     onMessage("Opened '${createdName}' in dedicated tab")
@@ -594,7 +637,7 @@ fun TmuxManagerSheet(
                         } else {
                             Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("Open Tab")
+                            Text("Start")
                         }
                     }
                 }
