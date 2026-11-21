@@ -154,9 +154,10 @@ fun sendTuiScrollStep(
     col: Int,
     row: Int,
 ) {
-    if (modes.mouseTracking) {
+    val isTmuxTab = bridge.tmuxSessionName != null
+    if (modes.mouseTracking || isTmuxTab) {
         val button = if (scrollUp) 64 else 65
-        if (modes.sgrMouse) {
+        if (modes.sgrMouse || isTmuxTab) {
             bridge.writeToTransport("\u001b[<$button;$col;${row}M".toByteArray(Charsets.US_ASCII))
         } else {
             val cx = (col.coerceIn(1, 223) + 32).toByte()
@@ -169,20 +170,16 @@ fun sendTuiScrollStep(
     }
 }
 
-/**
- * Intercepts single-finger vertical drags when a TUI app (OpenCode, Claude Code, tmux, vim, htop)
- * has enabled mouse reporting or alternate-screen mode, translating touch scrolling into
- * smooth SGR mouse-wheel events so full-screen TUIs scroll naturally on mobile.
- */
 fun Modifier.tuiTouchScroll(
     bridge: TerminalBridge,
     modes: TerminalInteractionModes,
     selectionActive: Boolean,
     onInteraction: () -> Unit,
 ): Modifier {
-    if (!modes.shouldForwardTouchScroll || selectionActive) return this
+    val active = (modes.shouldForwardTouchScroll || bridge.tmuxSessionName != null) && !selectionActive
+    if (!active) return this
 
-    return pointerInput(bridge.sessionUuid, modes, selectionActive) {
+    return pointerInput(bridge.sessionUuid, selectionActive) {
         awaitEachGesture {
             val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
             val pointerId = down.id
@@ -196,9 +193,9 @@ fun Modifier.tuiTouchScroll(
             val cols = (dims?.columns ?: 80).coerceAtLeast(1)
             val rows = (dims?.rows ?: 24).coerceAtLeast(1)
             val stepPx = if (size.height > 0) {
-                (size.height.toFloat() / rows.toFloat()).coerceIn(22f, 52f)
+                (size.height.toFloat() / rows.toFloat()).coerceIn(18f, 38f)
             } else {
-                32f
+                26f
             }
 
             while (true) {
@@ -226,6 +223,7 @@ fun Modifier.tuiTouchScroll(
                 }
 
                 if (verticalLocked) {
+                    val liveModes = bridge.terminalModeTracker.modes.value
                     change.consume()
                     wheelAccumulator += delta.y
 
@@ -242,11 +240,11 @@ fun Modifier.tuiTouchScroll(
 
                     // Natural scrolling: finger moves DOWN -> pull older content down (wheel UP)
                     while (wheelAccumulator >= stepPx) {
-                        sendTuiScrollStep(bridge, modes, scrollUp = true, col = col, row = row)
+                        sendTuiScrollStep(bridge, liveModes, scrollUp = true, col = col, row = row)
                         wheelAccumulator -= stepPx
                     }
                     while (wheelAccumulator <= -stepPx) {
-                        sendTuiScrollStep(bridge, modes, scrollUp = false, col = col, row = row)
+                        sendTuiScrollStep(bridge, liveModes, scrollUp = false, col = col, row = row)
                         wheelAccumulator += stepPx
                     }
                 }

@@ -1,12 +1,18 @@
 package org.connectbot.paullm
 
+import android.Manifest
 import android.app.Activity
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -29,6 +35,7 @@ import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -36,12 +43,14 @@ import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -134,8 +143,18 @@ fun PaullmComposeBar(
 
     var showModeMenu by remember { mutableStateOf(false) }
     var showPromptsMenu by remember { mutableStateOf(false) }
+    var isListening by remember { mutableStateOf(false) }
+    var partialSpeech by remember { mutableStateOf("") }
+    var speechRecognizer by remember { mutableStateOf<SpeechRecognizer?>(null) }
 
-    val voiceLauncher = rememberLauncherForActivityResult(
+    DisposableEffect(Unit) {
+        onDispose {
+            runCatching { speechRecognizer?.destroy() }
+            speechRecognizer = null
+        }
+    }
+
+    val voiceIntentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult(),
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
@@ -149,18 +168,112 @@ fun PaullmComposeBar(
         }
     }
 
-    fun startVoiceDictation() {
+    fun stopInAppRecognizer() {
+        runCatching { speechRecognizer?.stopListening() }
+        isListening = false
+        partialSpeech = ""
+    }
+
+    fun launchSpeechRecognition() {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_PROMPT, "Dictate for $targetLabel")
         }
-        val resolved = intent.resolveActivity(context.packageManager)
-        if (resolved == null) {
-            onMessage("No speech recognizer installed — use your keyboard microphone key.")
+        if (SpeechRecognizer.isRecognitionAvailable(context)) {
+            val sr = speechRecognizer ?: SpeechRecognizer.createSpeechRecognizer(context).also {
+                speechRecognizer = it
+            }
+            sr.setRecognitionListener(
+                object : RecognitionListener {
+                    override fun onReadyForSpeech(params: Bundle?) {
+                        isListening = true
+                        partialSpeech = "Listening..."
+                    }
+
+                    override fun onBeginningOfSpeech() = Unit
+                    override fun onRmsChanged(rmsdB: Float) = Unit
+                    override fun onBufferReceived(buffer: ByteArray?) = Unit
+                    override fun onEndOfSpeech() {
+                        isListening = false
+                    }
+
+                    override fun onError(error: Int) {
+                        isListening = false
+                        partialSpeech = ""
+                        if (error != SpeechRecognizer.ERROR_CLIENT && error != SpeechRecognizer.ERROR_NO_MATCH) {
+                            runCatching { voiceIntentLauncher.launch(intent) }.onFailure {
+                                onMessage("Speech error ($error) — you can also tap the keyboard mic.")
+                            }
+                        }
+                    }
+
+                    override fun onResults(results: Bundle?) {
+                        isListening = false
+                        partialSpeech = ""
+                        val spoken = results
+                            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            ?.firstOrNull()
+                            ?.trim()
+                        if (!spoken.isNullOrEmpty()) {
+                            ComposeDraftStore.appendDraft(sessionId, spoken, separator = " ")
+                        }
+                    }
+
+                    override fun onPartialResults(partialResults: Bundle?) {
+                        val partial = partialResults
+                            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            ?.firstOrNull()
+                            ?.trim()
+                        if (!partial.isNullOrEmpty()) {
+                            partialSpeech = partial
+                        }
+                    }
+
+                    override fun onEvent(eventType: Int, params: Bundle?) = Unit
+                },
+            )
+            runCatching {
+                isListening = true
+                partialSpeech = "Listening..."
+                sr.startListening(intent)
+            }.onFailure {
+                isListening = false
+                partialSpeech = ""
+                runCatching { voiceIntentLauncher.launch(intent) }.onFailure {
+                    onMessage("Speech input unavailable — use your keyboard mic key.")
+                }
+            }
+        } else {
+            runCatching { voiceIntentLauncher.launch(intent) }.onFailure {
+                onMessage("No speech recognizer installed — use your keyboard mic key.")
+            }
+        }
+    }
+
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            launchSpeechRecognition()
+        } else {
+            onMessage("Microphone permission denied — allow mic access or use keyboard dictation.")
+        }
+    }
+
+    fun startVoiceDictation() {
+        if (isListening) {
+            stopInAppRecognizer()
             return
         }
-        runCatching { voiceLauncher.launch(intent) }.onFailure {
-            onMessage("Speech input unavailable — use your keyboard microphone key.")
+        val hasMic = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (hasMic) {
+            launchSpeechRecognition()
+        } else {
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
 
@@ -213,6 +326,15 @@ fun PaullmComposeBar(
                 )
             }
 
+            if (isListening || partialSpeech.isNotEmpty()) {
+                Text(
+                    text = "🎙 $partialSpeech",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    maxLines = 2,
+                )
+            }
+
             OutlinedTextField(
                 value = draft,
                 onValueChange = { ComposeDraftStore.updateDraft(sessionId, it) },
@@ -239,8 +361,19 @@ fun PaullmComposeBar(
                 FilledTonalIconButton(
                     onClick = ::startVoiceDictation,
                     modifier = Modifier.size(36.dp),
+                    colors = if (isListening) {
+                        IconButtonDefaults.filledTonalIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer,
+                            contentColor = MaterialTheme.colorScheme.error,
+                        )
+                    } else {
+                        IconButtonDefaults.filledTonalIconButtonColors()
+                    },
                 ) {
-                    Icon(Icons.Default.Mic, contentDescription = "Dictate")
+                    Icon(
+                        if (isListening) Icons.Default.Stop else Icons.Default.Mic,
+                        contentDescription = if (isListening) "Stop dictation" else "Dictate",
+                    )
                 }
 
                 Row(
