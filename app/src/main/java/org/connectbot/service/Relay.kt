@@ -77,6 +77,7 @@ class Relay private constructor(
         onBytes = { bytes ->
             if (bridge.transport === transport) {
                 bridge.onOutputReceived()
+                bridge.terminalModeTracker.feed(bytes)
                 bridge.terminalEmulator.writeInput(bytes, 0, bytes.size)
             }
         },

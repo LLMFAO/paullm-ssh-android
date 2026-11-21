@@ -29,7 +29,9 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
@@ -59,6 +61,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.ContentPaste
@@ -164,6 +168,7 @@ import org.connectbot.data.entity.Host
 import org.connectbot.paullm.AiVendor
 import org.connectbot.paullm.AiVendorLogo
 import org.connectbot.paullm.ComposeDraftStore
+import org.connectbot.paullm.HostDashboardView
 import org.connectbot.paullm.PaullmComposeBar
 import org.connectbot.paullm.PaullmShell
 import org.connectbot.paullm.PresetsSheet
@@ -174,6 +179,7 @@ import org.connectbot.paullm.TmuxRemoteController
 import org.connectbot.paullm.TmuxSessionInfo
 import org.connectbot.paullm.TmuxSessionTabStrip
 import org.connectbot.paullm.ToolkitSheet
+import org.connectbot.paullm.tuiTouchScroll
 import org.connectbot.service.AuthBanner
 import org.connectbot.service.DisconnectReason
 import org.connectbot.service.PromptRequest
@@ -860,12 +866,20 @@ fun ConsoleScreen(
     var showToolkitSheet by remember(currentBridgeId) { mutableStateOf(false) }
     var showStatsSheet by remember(currentBridgeId) { mutableStateOf(false) }
     var showPresetsSheet by remember(currentBridgeId) { mutableStateOf(false) }
+    var showDashboardPane by rememberSaveable(currentBridge?.host?.id) { mutableStateOf(false) }
+    var autoLandedDashboardForHost by rememberSaveable(currentBridge?.host?.id) { mutableStateOf(false) }
     var remoteTmuxSessions by remember(currentBridge?.host?.id) { mutableStateOf<List<TmuxSessionInfo>>(emptyList()) }
 
-    val activeBridgeReadyForTmux = currentBridge?.supportsRemoteTools() == true && currentBridge?.isSessionOpen == true
+    val activeBridgeReadyForTmux = currentBridge?.supportsRemoteTools() == true && currentBridge.isSessionOpen
     LaunchedEffect(currentBridge?.host?.id, activeBridgeReadyForTmux, uiState.bridges.size) {
         val bridge = currentBridge ?: return@LaunchedEffect
         if (bridge.supportsRemoteTools() && bridge.isSessionOpen) {
+            if (!autoLandedDashboardForHost && bridge.tmuxSessionName == null) {
+                autoLandedDashboardForHost = true
+                showDashboardPane = true
+                showSoftwareKeyboard = false
+                keyboardController?.hide()
+            }
             runCatching { TmuxRemoteController.discover(bridge) }
                 .onSuccess { (installed, list) ->
                     if (installed) {
@@ -1283,36 +1297,79 @@ fun ConsoleScreen(
 
                 uiState.bridges.isNotEmpty() -> {
                     val activeBridge = uiState.bridges[uiState.currentBridgeIndex]
-                    TmuxSessionTabStrip(
-                        bridges = uiState.bridges,
-                        currentIndex = uiState.currentBridgeIndex,
-                        remoteTmuxSessions = remoteTmuxSessions,
-                        activeHostId = activeBridge.host.id,
-                        onSelectTab = { index -> selectBridgePreservingKeyboard(index) },
-                        onDetachTab = { target ->
-                            viewModel.detachTab(target)
-                            coroutineScope.launch {
-                                val msg = if (target.tmuxSessionName != null) {
-                                    "Detached from '${target.tmuxSessionName}' (session still running)"
-                                } else {
-                                    "Closed shell tab"
+                    if (showDashboardPane && activeBridge.supportsRemoteTools()) {
+                        val openTmuxForDash = uiState.bridges
+                            .filter { it.host.id == activeBridge.host.id }
+                            .mapNotNull { it.tmuxSessionName }
+                            .toSet()
+                        HostDashboardView(
+                            bridge = activeBridge,
+                            disconnected = disconnected,
+                            openTmuxNames = openTmuxForDash,
+                            sessions = remoteTmuxSessions,
+                            onSessionsUpdated = { remoteTmuxSessions = it },
+                            onAttachTmuxSession = { sessionName ->
+                                showDashboardPane = false
+                                viewModel.openOrSwitchTmuxTab(activeBridge.host, sessionName)
+                            },
+                            onDetachTmuxSession = { sessionName ->
+                                val targetBridge = uiState.bridges.firstOrNull {
+                                    it.host.id == activeBridge.host.id && it.tmuxSessionName == sessionName
                                 }
-                                snackbarHostState.showSnackbar(msg)
-                            }
-                        },
-                        onAttachRemoteSession = { remoteName ->
-                            viewModel.openOrSwitchTmuxTab(activeBridge.host, remoteName)
-                        },
-                        onOpenTmuxSheet = { showTmuxSheet = true },
-                    )
+                                if (targetBridge != null) {
+                                    viewModel.detachTab(targetBridge)
+                                    coroutineScope.launch {
+                                        snackbarHostState.showSnackbar("Detached client from '$sessionName'")
+                                    }
+                                }
+                            },
+                            onOpenNewSessionPicker = { showTmuxSheet = true },
+                            onDisconnectHost = {
+                                showDisconnectDialog = true
+                            },
+                            onReconnectHost = {
+                                showDashboardPane = false
+                                viewModel.reconnect(activeBridge)
+                            },
+                            onMessage = { msg ->
+                                coroutineScope.launch { snackbarHostState.showSnackbar(msg) }
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f),
+                        )
+                    } else {
+                        TmuxSessionTabStrip(
+                            bridges = uiState.bridges,
+                            currentIndex = uiState.currentBridgeIndex,
+                            remoteTmuxSessions = remoteTmuxSessions,
+                            activeHostId = activeBridge.host.id,
+                            onSelectTab = { index -> selectBridgePreservingKeyboard(index) },
+                            onDetachTab = { target ->
+                                viewModel.detachTab(target)
+                                coroutineScope.launch {
+                                    val msg = if (target.tmuxSessionName != null) {
+                                        "Detached from '${target.tmuxSessionName}' (session still running)"
+                                    } else {
+                                        "Closed shell tab"
+                                    }
+                                    snackbarHostState.showSnackbar(msg)
+                                }
+                            },
+                            onAttachRemoteSession = { remoteName ->
+                                viewModel.openOrSwitchTmuxTab(activeBridge.host, remoteName)
+                            },
+                            onOpenTmuxSheet = { showTmuxSheet = true },
+                        )
 
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f),
-                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f),
+                        ) {
                         val bridge = uiState.bridges[uiState.currentBridgeIndex]
-                        val terminalModifier = if (swipeBetweenSessions) {
+                        val tuiModes by bridge.terminalModeTracker.modes.collectAsState()
+                        val swipeModifier = if (swipeBetweenSessions) {
                             Modifier.sessionSwipeNavigation(
                                 currentIndex = uiState.currentBridgeIndex,
                                 sessionCount = uiState.bridges.size,
@@ -1323,6 +1380,12 @@ fun ConsoleScreen(
                         } else {
                             Modifier
                         }
+                        val terminalModifier = swipeModifier.tuiTouchScroll(
+                            bridge = bridge,
+                            modes = tuiModes,
+                            selectionActive = terminalSelectionActive,
+                            onInteraction = { handleTerminalInteraction(isInteraction = false) },
+                        )
 
                         key(bridge.sessionUuid) {
                             ConsoleTerminalPage(
@@ -1429,6 +1492,7 @@ fun ConsoleScreen(
                             },
                         )
                     }
+                    }
                 }
             }
         }
@@ -1533,9 +1597,11 @@ fun ConsoleScreen(
                 bridge = currentBridge,
                 openTmuxNames = openTmuxNames,
                 onOpenTmuxTab = { sessionName ->
+                    showDashboardPane = false
                     viewModel.openOrSwitchTmuxTab(currentBridge.host, sessionName)
                 },
                 onOpenNewShellTab = {
+                    showDashboardPane = false
                     viewModel.openNewShellTab(currentBridge.host)
                 },
                 onDetachCurrentTab = {
@@ -1568,6 +1634,7 @@ fun ConsoleScreen(
             ToolkitSheet(
                 bridge = currentBridge,
                 onOpenTmuxTab = { sessionName ->
+                    showDashboardPane = false
                     viewModel.openOrSwitchTmuxTab(currentBridge.host, sessionName)
                 },
                 onDismiss = {
@@ -1611,18 +1678,111 @@ fun ConsoleScreen(
         // or temporarily visible when titleBarHide is true and showTitleBar is true
         if (!titleBarHide || showTitleBar) {
             val density = LocalDensity.current
+            val remoteToolsReady = currentBridge?.supportsRemoteTools() == true
             TopAppBar(
                 title = {
-                    val titleVendor = AiVendor.detectFromName(
-                        name = currentBridge?.tmuxSessionName ?: currentBridge?.host?.nickname,
-                        isTmux = currentBridge?.tmuxSessionName != null,
-                    )
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (currentBridge != null) {
-                            AiVendorLogo(vendor = titleVendor, size = 18.dp)
-                            Spacer(Modifier.width(8.dp))
+                    if (remoteToolsReady) {
+                        // Sleek 3-way pill switcher matching iOS paullm-ssh: Dashboard | Terminal | Files
+                        Surface(
+                            shape = RoundedCornerShape(22.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.75f),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(3.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                            ) {
+                                Surface(
+                                    onClick = {
+                                        showDashboardPane = true
+                                        showSoftwareKeyboard = false
+                                        keyboardController?.hide()
+                                    },
+                                    shape = RoundedCornerShape(18.dp),
+                                    color = if (showDashboardPane) {
+                                        MaterialTheme.colorScheme.primaryContainer
+                                    } else {
+                                        androidx.compose.ui.graphics.Color.Transparent
+                                    },
+                                ) {
+                                    Box(
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Icon(
+                                            Icons.Default.BarChart,
+                                            contentDescription = "Host Dashboard",
+                                            modifier = Modifier.size(18.dp),
+                                            tint = if (showDashboardPane) {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                            },
+                                        )
+                                    }
+                                }
+                                Surface(
+                                    onClick = {
+                                        showDashboardPane = false
+                                        termFocusRequester.requestFocus()
+                                    },
+                                    shape = RoundedCornerShape(18.dp),
+                                    color = if (!showDashboardPane) {
+                                        MaterialTheme.colorScheme.primaryContainer
+                                    } else {
+                                        androidx.compose.ui.graphics.Color.Transparent
+                                    },
+                                ) {
+                                    Box(
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Terminal,
+                                            contentDescription = "Terminal",
+                                            modifier = Modifier.size(18.dp),
+                                            tint = if (!showDashboardPane) {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                            },
+                                        )
+                                    }
+                                }
+                                Surface(
+                                    onClick = {
+                                        showSoftwareKeyboard = false
+                                        keyboardController?.hide()
+                                        showSftpDialog = true
+                                    },
+                                    shape = RoundedCornerShape(18.dp),
+                                    color = androidx.compose.ui.graphics.Color.Transparent,
+                                ) {
+                                    Box(
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Folder,
+                                            contentDescription = "SFTP Files",
+                                            modifier = Modifier.size(18.dp),
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
+                            }
                         }
-                        Column {
+                    } else {
+                        val titleVendor = AiVendor.detectFromName(
+                            name = currentBridge?.tmuxSessionName ?: currentBridge?.host?.nickname,
+                            isTmux = currentBridge?.tmuxSessionName != null,
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (currentBridge != null) {
+                                AiVendorLogo(vendor = titleVendor, size = 18.dp)
+                                Spacer(Modifier.width(8.dp))
+                            }
                             Text(
                                 currentBridge?.displayTitle
                                     ?: stringResource(R.string.console_default_title),
@@ -1630,15 +1790,6 @@ fun ConsoleScreen(
                                 overflow = TextOverflow.Ellipsis,
                                 style = MaterialTheme.typography.titleMedium,
                             )
-                            if (currentBridge?.tmuxSessionName != null) {
-                                Text(
-                                    currentBridge.host.nickname,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
                         }
                     }
                 },
@@ -1665,67 +1816,48 @@ fun ConsoleScreen(
                     TopAppBarDefaults.topAppBarColors()
                 },
                 actions = {
-                    if (hasMultipleSessions) {
-                        IconButton(onClick = { showSessionPickerDialog = true }) {
+                    if (!showDashboardPane) {
+                        // Inline Compose + Voice bar toggle
+                        IconButton(
+                            onClick = { showComposeBar = !showComposeBar },
+                            enabled = currentBridge != null,
+                            modifier = Modifier.testTag("title_bar_text_input"),
+                        ) {
                             Icon(
-                                Icons.Default.SwapHoriz,
-                                contentDescription = stringResource(R.string.console_switch_session),
+                                Icons.Default.Edit,
+                                contentDescription = "Compose and voice bar",
+                                tint = if (showComposeBar) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                },
                             )
                         }
                     }
 
-                    val remoteToolsReady = currentBridge?.supportsRemoteTools() == true
-
-                    // Inline Compose + Voice bar toggle
-                    IconButton(
-                        onClick = { showComposeBar = !showComposeBar },
-                        enabled = currentBridge != null,
-                        modifier = Modifier.testTag("title_bar_text_input"),
-                    ) {
-                        Icon(
-                            Icons.Default.Edit,
-                            contentDescription = "Compose and voice bar",
-                            tint = if (showComposeBar) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                MaterialTheme.colorScheme.onSurface
-                            },
-                        )
-                    }
-
-                    // tmux Session Manager
+                    // + New Session / tmux manager button
                     if (remoteToolsReady) {
                         IconButton(
                             onClick = { showTmuxSheet = true },
                         ) {
                             Icon(
-                                Icons.Default.Terminal,
-                                contentDescription = "tmux sessions",
+                                Icons.Default.Add,
+                                contentDescription = "New tmux session",
                             )
                         }
-
-                        // SFTP File Browser
+                    } else {
+                        // Paste button when remote tools aren't active
                         IconButton(
-                            onClick = { showSftpDialog = true },
+                            onClick = {
+                                pasteClipboardContents()
+                            },
+                            enabled = currentBridge != null,
                         ) {
                             Icon(
-                                Icons.Default.Folder,
-                                contentDescription = "SFTP files",
+                                Icons.Default.ContentPaste,
+                                contentDescription = stringResource(R.string.console_menu_paste),
                             )
                         }
-                    }
-
-                    // Paste button - always visible
-                    IconButton(
-                        onClick = {
-                            pasteClipboardContents()
-                        },
-                        enabled = currentBridge != null,
-                    ) {
-                        Icon(
-                            Icons.Default.ContentPaste,
-                            contentDescription = stringResource(R.string.console_menu_paste),
-                        )
                     }
 
                     // More menu
@@ -1787,6 +1919,14 @@ fun ConsoleScreen(
                             }
 
                             if (remoteToolsReady) {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.console_menu_paste)) },
+                                    onClick = {
+                                        showMenu = false
+                                        pasteClipboardContents()
+                                    },
+                                    leadingIcon = { Icon(Icons.Default.ContentPaste, contentDescription = null) },
+                                )
                                 DropdownMenuItem(
                                     text = { Text("Command Presets") },
                                     onClick = {

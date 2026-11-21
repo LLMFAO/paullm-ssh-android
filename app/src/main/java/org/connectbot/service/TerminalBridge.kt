@@ -73,6 +73,7 @@ import org.connectbot.terminal.TerminalEmulator
 import org.connectbot.terminal.TerminalEmulatorFactory
 import org.connectbot.terminal.UrlScanScope
 import org.connectbot.paullm.SshExecResult
+import org.connectbot.paullm.TerminalModeTracker
 import org.connectbot.sshlib.SftpClient
 import org.connectbot.sshlib.SftpResult
 import org.connectbot.transport.AbsTransport
@@ -426,6 +427,8 @@ class TerminalBridge {
     val sessionUuid: UUID = UUID.randomUUID()
 
     val tmuxSessionName: String?
+
+    val terminalModeTracker = TerminalModeTracker()
 
     val displayTitle: String
         get() = tmuxSessionName ?: host.nickname
@@ -1132,6 +1135,7 @@ class TerminalBridge {
         authenticationFailure = null
         disconnectReason = DisconnectReason.UNKNOWN
         sessionAttention.onReconnected()
+        terminalModeTracker.reset()
 
         // We no longer need our local output.
         localOutput.clear()
