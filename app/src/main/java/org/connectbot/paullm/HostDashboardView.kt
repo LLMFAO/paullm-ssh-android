@@ -463,7 +463,7 @@ fun HostDashboardView(
                 } else {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         sessions.forEach { session ->
-                            val vendor = AiVendor.detectFromName(session.name, isTmux = true)
+                            val vendor = session.detectedVendor
                             val isLoaded = session.name in openTmuxNames
                             Row(
                                 modifier = Modifier
@@ -504,7 +504,8 @@ fun HostDashboardView(
                                     }
                                     Text(
                                         text = buildString {
-                                            append("${session.windowCount} windows")
+                                            session.activeCommand?.takeIf { it.isNotBlank() }?.let { append("$it · ") }
+                                            append("${session.windowCount}w")
                                             session.currentPath?.let { append(" · $it") }
                                             if (session.attachedCount > 0) append(" · attached")
                                         },

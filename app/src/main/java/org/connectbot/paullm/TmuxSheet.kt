@@ -63,6 +63,8 @@ data class TmuxSessionInfo(
     val attachedCount: Int,
     val windowCount: Int,
     val currentPath: String?,
+    val activeCommand: String? = null,
+    val detectedVendor: AiVendor = AiVendor.detectFromName(name, isTmux = true),
 )
 
 enum class TmuxLaunchPreset(
@@ -97,32 +99,88 @@ object TmuxRemoteController {
             return false to emptyList()
         }
 
+        val discoveryBody = """
+            tmux list-sessions -F 'S	#{session_name}	#{session_attached}	#{session_windows}	#{pane_current_path}' 2>/dev/null || true
+            tmux list-panes -a -F 'P	#{session_name}	#{pane_current_command}	#{pane_pid}	#{pane_title}' 2>/dev/null || true
+            ps -eo ppid=,args= 2>/dev/null | awk '{p=${'$'}1; ${'$'}1=""; sub(/^ +/,""); print "C\t" p "\t" ${'$'}0}' | grep -iE 'claude|codex|grok|opencode|agy|antigravity|gemini|aider|goose|ollama|copilot|qwen|(^|[ /])pi( |${'$'})' | head -n 80 || true
+        """.trimIndent()
+
         val listResult = bridge.execCommand(
-            PaullmShell.wrapLoginShell(
-                "tmux list-sessions -F '#{session_name}\t#{session_attached}\t#{session_windows}\t#{pane_current_path}' 2>/dev/null || true",
-            ),
+            PaullmShell.wrapLoginShell(discoveryBody),
             timeoutMs = 10_000L,
         )
-        val parsed = listResult.stdout
-            .lineSequence()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .mapNotNull { line ->
-                val parts = line.split('\t')
-                val name = parts.getOrNull(0)?.trim().orEmpty()
-                if (name.isEmpty()) {
-                    null
-                } else {
-                    TmuxSessionInfo(
-                        name = name,
-                        attachedCount = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: 0,
-                        windowCount = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: 1,
-                        currentPath = parts.getOrNull(3)?.trim()?.takeIf { it.isNotEmpty() },
-                    )
+
+        val childArgsByPpid = mutableMapOf<String, MutableList<String>>()
+        val paneSignalsBySession = mutableMapOf<String, MutableList<Triple<String, String, String>>>()
+        val rawSessions = mutableListOf<List<String>>()
+
+        listResult.stdout.lineSequence().forEach { rawLine ->
+            val line = rawLine.trimEnd('\r')
+            if (line.isBlank()) return@forEach
+            val parts = line.split('\t')
+            when (parts.firstOrNull()) {
+                "S" -> if (parts.size >= 2) rawSessions.add(parts)
+                "P" -> if (parts.size >= 4) {
+                    val sName = parts[1].trim()
+                    val cmd = parts[2].trim()
+                    val pid = parts[3].trim()
+                    val title = parts.getOrNull(4)?.trim().orEmpty()
+                    paneSignalsBySession.getOrPut(sName) { mutableListOf() }.add(Triple(cmd, pid, title))
+                }
+
+                "C" -> if (parts.size >= 3) {
+                    val ppid = parts[1].trim()
+                    val args = parts[2].trim()
+                    childArgsByPpid.getOrPut(ppid) { mutableListOf() }.add(args)
                 }
             }
-            .sortedBy { it.name.lowercase() }
-            .toList()
+        }
+
+        val parsed = rawSessions.mapNotNull { parts ->
+            val name = parts.getOrNull(1)?.trim().orEmpty()
+            if (name.isEmpty()) return@mapNotNull null
+
+            val panes = paneSignalsBySession[name].orEmpty()
+            val primaryCmd = panes.firstOrNull()?.first?.takeIf { it.isNotEmpty() }
+
+            // Detect AI vendor from: (1) pane_current_command, (2) child process cmdline, (3) pane_title, (4) session name
+            var detected: AiVendor? = null
+            var detectedCmd: String? = primaryCmd
+            for ((cmd, pid, title) in panes) {
+                val fromCmd = AiVendor.detectFromName(cmd, isTmux = false)
+                if (fromCmd != AiVendor.SHELL && fromCmd != AiVendor.TMUX) {
+                    detected = fromCmd
+                    detectedCmd = cmd
+                    break
+                }
+                val children = childArgsByPpid[pid].orEmpty()
+                for (childArgs in children) {
+                    val fromChild = AiVendor.detectFromName(childArgs, isTmux = false)
+                    if (fromChild != AiVendor.SHELL && fromChild != AiVendor.TMUX) {
+                        detected = fromChild
+                        detectedCmd = fromChild.label.lowercase()
+                        break
+                    }
+                }
+                if (detected != null) break
+
+                val fromTitle = AiVendor.detectFromName(title, isTmux = false)
+                if (fromTitle != AiVendor.SHELL && fromTitle != AiVendor.TMUX) {
+                    detected = fromTitle
+                    break
+                }
+            }
+            val finalVendor = detected ?: AiVendor.detectFromName(name, isTmux = true)
+
+            TmuxSessionInfo(
+                name = name,
+                attachedCount = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: 0,
+                windowCount = parts.getOrNull(3)?.trim()?.toIntOrNull() ?: 1,
+                currentPath = parts.getOrNull(4)?.trim()?.takeIf { it.isNotEmpty() },
+                activeCommand = detectedCmd,
+                detectedVendor = finalVendor,
+            )
+        }.sortedBy { it.name.lowercase() }
         return true to parsed
     }
 
@@ -408,7 +466,7 @@ fun TmuxManagerSheet(
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         items(sessions, key = { it.name }) { session ->
-                            val vendor = AiVendor.detectFromName(session.name, isTmux = true)
+                            val vendor = session.detectedVendor
                             val isOpenTab = session.name in openTmuxNames
                             val isCurrent = bridge.tmuxSessionName == session.name
                             Card(

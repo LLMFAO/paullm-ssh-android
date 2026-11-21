@@ -46,6 +46,8 @@ fun TmuxSessionTabStrip(
     onOpenTmuxSheet: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val vendorBySessionName = remoteTmuxSessions.associate { it.name to it.detectedVendor }
+
     val openTmuxForActiveHost = bridges
         .filter { it.host.id == activeHostId }
         .mapNotNull { it.tmuxSessionName }
@@ -69,10 +71,11 @@ fun TmuxSessionTabStrip(
             bridges.forEachIndexed { index, bridge ->
                 val isSelected = index == currentIndex
                 val isTmux = bridge.tmuxSessionName != null
-                val vendor = AiVendor.detectFromName(
-                    name = bridge.tmuxSessionName ?: bridge.host.nickname,
-                    isTmux = isTmux,
-                )
+                val vendor = bridge.tmuxSessionName?.let { vendorBySessionName[it] }
+                    ?: AiVendor.detectFromName(
+                        name = bridge.tmuxSessionName ?: bridge.host.nickname,
+                        isTmux = isTmux,
+                    )
                 val tabLabel = if (bridge.tmuxSessionName != null) {
                     bridge.tmuxSessionName
                 } else {
@@ -134,7 +137,7 @@ fun TmuxSessionTabStrip(
 
             // Show live remote tmux sessions not yet opened as tabs for 1-tap attach!
             unattachedRemote.forEach { remote ->
-                val vendor = AiVendor.detectFromName(remote.name, isTmux = true)
+                val vendor = remote.detectedVendor
                 Surface(
                     onClick = { onAttachRemoteSession(remote.name) },
                     shape = RoundedCornerShape(10.dp),

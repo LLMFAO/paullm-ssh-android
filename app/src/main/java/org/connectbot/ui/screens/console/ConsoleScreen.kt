@@ -1466,10 +1466,12 @@ fun ConsoleScreen(
 
                     val activeBridgeForCompose = uiState.bridges[uiState.currentBridgeIndex]
                     if (showComposeBar) {
-                        val composeVendor = AiVendor.detectFromName(
-                            name = activeBridgeForCompose.tmuxSessionName ?: activeBridgeForCompose.host.nickname,
-                            isTmux = activeBridgeForCompose.tmuxSessionName != null,
-                        )
+                        val composeVendor = activeBridgeForCompose.tmuxSessionName
+                            ?.let { name -> remoteTmuxSessions.firstOrNull { it.name == name }?.detectedVendor }
+                            ?: AiVendor.detectFromName(
+                                name = activeBridgeForCompose.tmuxSessionName ?: activeBridgeForCompose.host.nickname,
+                                isTmux = activeBridgeForCompose.tmuxSessionName != null,
+                            )
                         PaullmComposeBar(
                             sessionId = activeBridgeForCompose.sessionUuid,
                             targetLabel = activeBridgeForCompose.displayTitle,
