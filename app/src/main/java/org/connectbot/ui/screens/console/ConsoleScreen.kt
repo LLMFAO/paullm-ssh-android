@@ -1411,7 +1411,7 @@ fun ConsoleScreen(
                                 keyboardController?.hide()
                                 triggerCosPrompt(
                                     activeBridge,
-                                    "Give me an executive Chief of Staff briefing across all tmux sessions. Bubble up decisions and blockers first.",
+                                    "Give me an executive Chief of Staff briefing combining my canonical vault on delllap and active tmux sessions. Highlight top priorities, open decisions, and blockers.",
                                 )
                             },
                             onAttachTmuxSession = { sessionName ->
@@ -1468,6 +1468,7 @@ fun ConsoleScreen(
                                 activePaneName = "TERMINAL"
                                 viewModel.openOrSwitchTmuxTab(activeBridge.host, sessionName)
                             },
+                            onOpenUrl = ::openUrl,
                             onSessionsChanged = {
                                 coroutineScope.launch {
                                     runCatching { TmuxRemoteController.discover(activeBridge) }

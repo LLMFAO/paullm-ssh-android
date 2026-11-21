@@ -162,15 +162,24 @@ data class CosSessionDecision(
     val suggestedActions: List<CosAction>,
 )
 
+data class CosVaultRef(
+    val title: String,
+    val path: String,
+    val perliteUrl: String,
+    val relevance: String = "",
+)
+
 data class CosBriefingPayload(
     val headline: String,
     val reply: String,
     val sessions: List<CosSessionDecision>,
     val orchestratorActions: List<CosAction>,
+    val vaultRefs: List<CosVaultRef> = emptyList(),
     val backendUsed: String,
     val modelUsed: String,
     val conversationId: String?,
     val scannedCount: Int,
+    val vaultNotesChecked: Int = 0,
     val generatedAtMs: Long = System.currentTimeMillis(),
 ) {
     val decisionCount: Int
@@ -198,12 +207,23 @@ object ChiefOfStaffEngine {
     val DEFAULT_AGENTS_MD = """
         # Chief of Staff Orchestrator — AGENTS.md
 
-        You are Paul's executive Chief of Staff & multi-session orchestrator monitoring all active `tmux` sessions on this server.
+        You are Paul's executive Chief of Staff & strategic orchestrator. You help Paul make high-leverage decisions across ALL of his projects, notes, priorities, and active engineering work—NOT just what happens to be open in `tmux`.
 
-        ## Mission
-        - Synthesize what every active `tmux` session is doing based strictly on the captured pane output and metadata.
-        - Bubble up anything requiring Paul's judgment (`NEEDS_DECISION`), stuck/errored (`BLOCKED`), or awaiting a prompt (`WAITING_INPUT`) to the top.
-        - Keep `RUNNING`, `DONE`, and `IDLE` sessions concise so Paul can scan the whole host in 5 seconds.
+        ## Big-Picture Mindset (Avoid tmux Myopia)
+        - **Lead with Paul's actual question and strategic context.** Active `tmux` sessions are ONE live execution signal—not the whole picture.
+        - Ground your recommendations in Paul's canonical Obsidian vault on `delllap` (`/home/paul/ObsidianVault_Final`: project roadmaps, goals, open decisions, recent agent updates, architecture docs, runbooks) as well as live `tmux` / host state.
+        - **Only include `sessions` cards that are relevant**:
+          - On an explicit full briefing ("Brief me on all tmux sessions" / "Brief Now"), summarize all live `tmux` sessions sorted by urgency (`NEEDS_DECISION`, `BLOCKED`, `WAITING_INPUT`, `RUNNING`, `DONE`, `IDLE`) AND highlight relevant vault context/priorities.
+          - On a broader strategic, vault, priority, or single-project question, answer the big-picture question thoroughly in `reply` using vault + subagent research, and include ONLY relevant `tmux` sessions in `sessions` (or `[]` if `tmux` isn't relevant to the question).
+
+        ## Canonical Vault Access (`delllap`) & Subagent Delegation
+        - Paul's canonical personal Obsidian vault lives on SSH host `delllap` at `/home/paul/ObsidianVault_Final`.
+        - Never use stale local mirrors, and never touch `ubuntu-server`'s `/home/paul/commure-athelas-vault`.
+        - Pre-loaded `VAULT CONTEXT` (recent notes + matched excerpts from `delllap`) is included with every turn for fast orientation.
+        - **Spin up subagents for deeper research**: Whenever Paul asks about project plans, priorities, specs, past decisions, runbooks, cross-project tradeoffs, or topics not fully covered by the pre-loaded excerpts, spin up read-only subagents (`invoke_subagent`) to search/read `delllap:/home/paul/ObsidianVault_Final` (via `ssh -o BatchMode=yes delllap ...`) in parallel, then synthesize a crisp executive answer.
+        - **Never edit or delete vault notes** unless Paul explicitly requests a vault write.
+        - Whenever you rely on vault notes, cite them in `vault_refs` using the exact Perlite URL format:
+          `https://delllap.tailfaa66b.ts.net/wiki/?link=/<path-without-.md>`
 
         ## Orchestrator Permissions (CRITICAL)
         - **NEVER** start or kill `tmux` sessions directly inside tool calls.
@@ -214,11 +234,9 @@ object ChiefOfStaffEngine {
         - Paul will approve permission-gated actions with one tap in the Android Chat UI.
 
         ## Style & Truthfulness
-        - Be concise, sharp, and executive. Zero fluff.
-        - Cite exact session names, branch/dir context, and real errors from the captured output.
-        - Never invent progress or hide failures.
+        - Be concise, sharp, strategic, and executive. Zero fluff.
+        - Cite real vault notes, open decisions, and live session evidence—never invent facts or hide failures.
         - Write `reply` in clean human-readable prose/bullets (never dump raw JSON inside `reply`).
-        - Do NOT run slow shell/file tools when the live `tmux` snapshot already answers the user's question.
     """.trimIndent()
 
     private val PYTHON_RUNNER = """
@@ -274,6 +292,19 @@ SCHEMA = {
                     "risky": {"type": "boolean"}
                 },
                 "required": ["action_type", "label", "session", "risky"]
+            }
+        },
+        "vault_refs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "path": {"type": "string"},
+                    "perlite_url": {"type": "string"},
+                    "relevance": {"type": "string"}
+                },
+                "required": ["title", "path", "perlite_url"]
             }
         }
     },
@@ -347,6 +378,103 @@ def capture_tmux():
             "recent_output": tail,
         })
     return snap
+
+def capture_vault_context(snap, user_msg):
+    # Fast read-only context pull from canonical vault on delllap:/home/paul/ObsidianVault_Final
+    vault_root = "/home/paul/ObsidianVault_Final"
+    perlite_base = "https://delllap.tailfaa66b.ts.net/wiki/?link=/"
+    terms = set()
+    stop = {"the", "and", "for", "with", "that", "this", "from", "what", "which", "are", "all", "tmux", "session", "sessions", "brief", "briefing", "status", "right", "now", "about", "into", "your", "have", "vault", "delllap", "check", "give", "chief", "staff"}
+    raw_sources = [user_msg] + [s.get("session", "") + " " + s.get("title", "") + " " + os.path.basename(s.get("cwd", "")) for s in snap]
+    for src in raw_sources:
+        for tok in re.findall(r"[A-Za-z0-9]{3,}", src.lower()):
+            if tok not in stop:
+                terms.add(tok)
+    terms_b64 = base64.b64encode(json.dumps(sorted(terms)[:24]).encode()).decode()
+
+    remote_py = f'''
+import base64, json, os, pathlib, re
+root = pathlib.Path({vault_root!r})
+if not root.is_dir():
+    print(json.dumps({{"available": False, "recent": [], "excerpts": []}}))
+    raise SystemExit(0)
+terms = json.loads(base64.b64decode({terms_b64!r}).decode())
+files = []
+for sub in ["INBOX/Agent-Updates", "PROJECTS", "."]:
+    base = root / sub if sub != "." else root
+    if not base.is_dir():
+        continue
+    max_depth = 3 if sub != "." else 1
+    for dirpath, dirnames, filenames in os.walk(base):
+        rel_dir = os.path.relpath(dirpath, base)
+        depth = 0 if rel_dir == "." else rel_dir.count(os.sep) + 1
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("ARCHIVE-BACKUP", ".trash", "node_modules")]
+        if depth >= max_depth:
+            dirnames[:] = []
+        for fn in filenames:
+            if not fn.endswith(".md"):
+                continue
+            fp = pathlib.Path(dirpath) / fn
+            try:
+                mt = fp.stat().st_mtime
+                rel = fp.relative_to(root).as_posix()
+                files.append((mt, rel, fp))
+            except Exception:
+                pass
+files.sort(key=lambda x: x[0], reverse=True)
+seen = set()
+dedup = []
+for mt, rel, fp in files:
+    if rel not in seen:
+        seen.add(rel)
+        dedup.append((mt, rel, fp))
+
+recent = [{{"path": rel, "perlite_url": {perlite_base!r} + rel[:-3]}} for _, rel, _ in dedup[:14]]
+
+scored = []
+for idx, (mt, rel, fp) in enumerate(dedup[:160]):
+    low = rel.lower()
+    hits = sum(2 for t in terms if t in low)
+    if hits > 0 or idx < 4:
+        scored.append((hits, -idx, rel, fp))
+scored.sort(reverse=True)
+
+excerpts = []
+for _, _, rel, fp in scored[:6]:
+    try:
+        txt = fp.read_text(encoding="utf-8", errors="ignore")
+        if txt.startswith("---"):
+            end_fm = txt.find("\\n---", 3)
+            if end_fm != -1:
+                txt = txt[end_fm + 4:]
+        lines = [l.rstrip() for l in txt.strip().splitlines() if l.strip()]
+        title = next((l.lstrip("# ").strip() for l in lines[:4] if l.startswith("#")), pathlib.Path(rel).stem)
+        excerpt = "\\n".join(lines[:22])[:850]
+        excerpts.append({{
+            "title": title[:90],
+            "path": rel,
+            "perlite_url": {perlite_base!r} + rel[:-3],
+            "excerpt": excerpt,
+        }})
+    except Exception:
+        pass
+print(json.dumps({{"available": True, "recent": recent, "excerpts": excerpts}}))
+'''
+    host = run_cmd(["hostname"]).strip().lower()
+    if host.startswith("delllap") and os.path.isdir(vault_root):
+        cmd = ["python3", "-c", remote_py]
+    else:
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", "delllap", "python3 -"]
+    try:
+        if cmd[0] == "ssh":
+            p = subprocess.run(cmd, input=remote_py, capture_output=True, text=True, timeout=8)
+        else:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+        if p.returncode == 0 and p.stdout.strip():
+            return json.loads(p.stdout.strip().splitlines()[-1])
+    except Exception as e:
+        return {"available": False, "error": str(e), "recent": [], "excerpts": []}
+    return {"available": False, "recent": [], "excerpts": []}
 
 def resolve_agy_bin():
     home = pathlib.Path.home()
@@ -478,13 +606,18 @@ def main():
     schema_path.write_text(json.dumps(SCHEMA, indent=2), encoding="utf-8")
 
     snap = capture_tmux()
+    vault_ctx = capture_vault_context(snap, user_msg)
     schema_hint = json.dumps(SCHEMA)
     system_prompt = (
         agents_md.strip() + "\n\n"
         "OUTPUT CONTRACT: Return ONLY a valid JSON object matching this schema:\n"
         + schema_hint + "\n"
-        "Include every captured tmux session in `sessions`, sorted by urgency "
+        "For full tmux briefings, include all captured tmux sessions in `sessions` sorted by urgency "
         "(NEEDS_DECISION, BLOCKED, WAITING_INPUT, RUNNING, DONE, IDLE). "
+        "For broader vault/strategy/priority questions, focus `reply` on the big picture and include ONLY "
+        "the relevant tmux sessions in `sessions` (or `[]` if tmux is not relevant). "
+        "Whenever you use facts from the canonical vault on delllap, include those notes in `vault_refs` "
+        "with exact Perlite URLs (`https://delllap.tailfaa66b.ts.net/wiki/?link=/<path-without-.md>`). "
         "Keep `reply` as crisp human-readable prose/bullets, never raw JSON."
     )
 
@@ -496,8 +629,9 @@ def main():
     user_prompt = (
         hist_block
         + "USER REQUEST:\n" + user_msg + "\n\n"
-        + "LIVE TMUX SNAPSHOT (use this directly; stay fast and do NOT run destructive commands):\n"
-        + json.dumps(snap)
+        + "LIVE TMUX SNAPSHOT:\n" + json.dumps(snap) + "\n\n"
+        + "CANONICAL VAULT CONTEXT (delllap:/home/paul/ObsidianVault_Final — you may also spin up read-only subagents to query `ssh -o BatchMode=yes delllap ...` if deeper vault info is needed):\n"
+        + json.dumps(vault_ctx)
     )
     combined_prompt = system_prompt + "\n\n" + user_prompt
 
@@ -517,13 +651,13 @@ def main():
     for step in order:
         try:
             if step == "agy_flash":
-                result = try_agy("gemini-3.8-flash-low", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=False, timeout_s=55)
+                result = try_agy("gemini-3.8-flash-low", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=80)
             elif step == "agy_orch_neon":
-                result = try_agy("gemini-pro-orchestrator-neon", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=135)
+                result = try_agy("gemini-pro-orchestrator-neon", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=145)
             elif step == "agy_orch_argon":
-                result = try_agy("gemini-pro-orchestrator-g1-pro", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=135)
+                result = try_agy("gemini-pro-orchestrator-g1-pro", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=145)
             elif step == "agy_neon_low":
-                result = try_agy("gemini-4-neon-low", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=75)
+                result = try_agy("gemini-4-neon-low", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=85)
             elif step == "ollama":
                 result = try_ollama(system_prompt, user_prompt)
             elif step == "pi":
@@ -548,6 +682,7 @@ def main():
         "model": used_model,
         "conversation_id": next_conv_id,
         "scanned_count": len(snap),
+        "vault_notes_checked": len(vault_ctx.get("excerpts") or []),
         "snapshot_meta": {s["session"]: {"cmd": s["cmd"], "child_cmds": s["child_cmds"], "title": s["title"]} for s in snap},
         "data": parsed,
     }))
@@ -644,7 +779,7 @@ if __name__ == "__main__":
             python3 "${'$'}HOME/.config/paullm-cos/cos_runner.py" '$reqB64'
         """.trimIndent()
 
-        val timeoutMs = if (backend == CosBackend.AGY_ORCH) 155_000L else 95_000L
+        val timeoutMs = if (backend == CosBackend.AGY_ORCH) 165_000L else 105_000L
         val res = bridge.execCommand(PaullmShell.wrapLoginShell(script), timeoutMs = timeoutMs)
         if (res.error != null) {
             return Result.failure(IllegalStateException(res.error))
@@ -751,16 +886,41 @@ if __name__ == "__main__":
             parsedSessions.sortWith(compareBy<CosSessionDecision> { it.urgency.rank }.thenBy { it.session.lowercase() })
 
             val orchActions = parseActions(data.optJSONArray("orchestrator_actions"), "")
+            val parsedVaultRefs = mutableListOf<CosVaultRef>()
+            val vaultArr = data.optJSONArray("vault_refs")
+            if (vaultArr != null) {
+                for (i in 0 until vaultArr.length()) {
+                    val v = vaultArr.optJSONObject(i) ?: continue
+                    val title = v.optString("title").trim()
+                    val path = v.optString("path").trim()
+                    val rawUrl = v.optString("perlite_url").trim()
+                    if (title.isEmpty() && path.isEmpty()) continue
+                    val perliteUrl = rawUrl.ifEmpty {
+                        val cleanPath = path.removePrefix("/").removeSuffix(".md")
+                        "https://delllap.tailfaa66b.ts.net/wiki/?link=/$cleanPath"
+                    }
+                    parsedVaultRefs.add(
+                        CosVaultRef(
+                            title = title.ifEmpty { path.substringAfterLast('/').removeSuffix(".md") },
+                            path = path,
+                            perliteUrl = perliteUrl,
+                            relevance = v.optString("relevance").trim(),
+                        ),
+                    )
+                }
+            }
 
             CosBriefingPayload(
                 headline = data.optString("headline").trim().ifEmpty { "Briefing complete" },
                 reply = data.optString("reply").trim(),
                 sessions = parsedSessions,
                 orchestratorActions = orchActions,
+                vaultRefs = parsedVaultRefs,
                 backendUsed = env.optString("backend", backend.label),
                 modelUsed = env.optString("model", backend.label),
                 conversationId = env.optString("conversation_id").takeIf { it.isNotBlank() && it != "null" },
                 scannedCount = env.optInt("scanned_count", parsedSessions.size),
+                vaultNotesChecked = env.optInt("vault_notes_checked", parsedVaultRefs.size),
             )
         }
     }
@@ -949,6 +1109,7 @@ fun ChiefOfStaffChatView(
     onSendPrompt: (String) -> Unit,
     onClearChat: () -> Unit,
     onJumpToSession: (String) -> Unit,
+    onOpenUrl: (String) -> Unit,
     onSessionsChanged: () -> Unit,
     onMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -1322,7 +1483,7 @@ fun ChiefOfStaffChatView(
                         Surface(
                             onClick = {
                                 if (!isRunning && !disconnected) {
-                                    onSendPrompt("Give me an executive Chief of Staff briefing across all tmux sessions. Bubble up decisions and blockers first.")
+                                    onSendPrompt("Give me an executive Chief of Staff briefing combining my canonical vault on delllap and active tmux sessions. Highlight top priorities, open decisions, and blockers.")
                                 }
                             },
                             shape = RoundedCornerShape(999.dp),
@@ -1410,13 +1571,14 @@ fun ChiefOfStaffChatView(
                                 color = Color.White,
                             )
                             Text(
-                                text = "Runs on-demand directly on ${bridge.host.nickname}, inspects all live tmux panes using ~/.config/paullm-cos/AGENTS.md, bubbles up decisions & blockers, and can send replies or start/end tmux sessions with your permission.",
+                                text = "Runs on-demand directly on ${bridge.host.nickname}, inspects all live tmux panes + your Obsidian vault on delllap (with subagent research), uses ~/.config/paullm-cos/AGENTS.md, and can send replies or start/end tmux sessions with your permission.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = CosMuted,
                             )
                             val starters = listOf(
-                                "Brief me on all tmux sessions",
-                                "What needs my decision right now?",
+                                "What should I prioritize right now? (vault + active sessions)",
+                                "Brief me on all tmux sessions & decisions",
+                                "Summarize recent vault updates & open decisions on delllap",
                                 "Which sessions are blocked or done and safe to end?",
                             )
                             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1474,6 +1636,7 @@ fun ChiefOfStaffChatView(
                             }
                         },
                         onJumpToSession = onJumpToSession,
+                        onOpenUrl = onOpenUrl,
                     )
                 }
             }
@@ -1520,7 +1683,7 @@ fun ChiefOfStaffChatView(
                     modifier = Modifier.weight(1f),
                     placeholder = {
                         Text(
-                            if (isListeningVoice) "Listening…" else "Ask CoS, or start/end a tmux session…",
+                            if (isListeningVoice) "Listening…" else "Ask CoS anything (vault, priorities, tmux…)",
                             style = MaterialTheme.typography.bodySmall,
                             color = CosMuted,
                             maxLines = 1,
@@ -1601,6 +1764,7 @@ private fun CosAssistantMessageBubble(
     completedActionIds: List<String>,
     onActionClick: (CosAction) -> Unit,
     onJumpToSession: (String) -> Unit,
+    onOpenUrl: (String) -> Unit,
 ) {
     val timeLabel = remember(message.timestampMs) {
         SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(message.timestampMs))
@@ -1645,7 +1809,13 @@ private fun CosAssistantMessageBubble(
                         )
                         Spacer(Modifier.width(8.dp))
                         Text(
-                            text = "${briefing.scannedCount} sessions · $timeLabel",
+                            text = buildString {
+                                append("${briefing.scannedCount} tmux")
+                                if (briefing.vaultNotesChecked > 0) {
+                                    append(" · ${briefing.vaultNotesChecked} vault")
+                                }
+                                append(" · $timeLabel")
+                            },
                             style = MaterialTheme.typography.labelSmall,
                             color = CosMuted,
                         )
@@ -1669,6 +1839,53 @@ private fun CosAssistantMessageBubble(
                         style = MaterialTheme.typography.bodyMedium,
                         color = Color.White,
                     )
+                }
+
+                // Vault Note References (clickable Perlite links on delllap)
+                if (briefing != null && briefing.vaultRefs.isNotEmpty()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Text(
+                            text = "VAULT CONTEXT (DELLLAP)",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFFC084FC),
+                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            briefing.vaultRefs.forEach { ref ->
+                                Surface(
+                                    onClick = { onOpenUrl(ref.perliteUrl) },
+                                    shape = RoundedCornerShape(999.dp),
+                                    color = Color(0xFFA855F7).copy(alpha = 0.14f),
+                                    border = BorderStroke(1.dp, Color(0xFFA855F7).copy(alpha = 0.45f)),
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Description,
+                                            contentDescription = null,
+                                            tint = Color(0xFFC084FC),
+                                            modifier = Modifier.size(12.dp),
+                                        )
+                                        Text(
+                                            text = ref.title,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = Color(0xFFE9D5FF),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Global Orchestrator Lifecycle Actions (START_TMUX / KILL_TMUX / cross-session SEND)
