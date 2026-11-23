@@ -1719,18 +1719,26 @@ fun ConsoleScreen(
                                 .weight(1f),
                         ) {
                         val bridge = uiState.bridges[uiState.currentBridgeIndex]
+                        val hostBridgeIndices = uiState.bridges.mapIndexedNotNull { idx, b ->
+                            if (b.host.id == bridge.host.id) idx else null
+                        }
+                        val hostLocalIndex = hostBridgeIndices.indexOf(uiState.currentBridgeIndex).coerceAtLeast(0)
                         val isSelectionActiveCheck: () -> Boolean = {
                             selectionControllerEntry
                                 ?.takeIf { it.first == bridge.sessionUuid }
                                 ?.second
                                 ?.isSelectionActive == true
                         }
-                        val swipeModifier = if (swipeBetweenSessions) {
+                        val swipeModifier = if (swipeBetweenSessions && hostBridgeIndices.size > 1) {
                             Modifier.sessionSwipeNavigation(
-                                currentIndex = uiState.currentBridgeIndex,
-                                sessionCount = uiState.bridges.size,
+                                currentIndex = hostLocalIndex,
+                                sessionCount = hostBridgeIndices.size,
                                 isSelectionActive = isSelectionActiveCheck,
-                                onSwipeToSession = { index -> selectBridgePreservingKeyboard(index) },
+                                onSwipeToSession = { localIndex ->
+                                    hostBridgeIndices.getOrNull(localIndex)?.let { globalIdx ->
+                                        selectBridgePreservingKeyboard(globalIdx)
+                                    }
+                                },
                                 onInteraction = { handleTerminalInteraction(isInteraction = false) },
                             )
                         } else {

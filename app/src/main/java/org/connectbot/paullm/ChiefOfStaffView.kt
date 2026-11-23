@@ -81,10 +81,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.launch
@@ -100,10 +105,11 @@ enum class CosBackend(val id: String, val label: String) {
     AUTO("auto", "Auto"),
     AGY_FLASH("agy_flash", "AGY Flash"),
     AGY_ORCH("agy_orch", "AGY Orch"),
-    OLLAMA("ollama", "Ollama"),
-    PI("pi", "pi"),
+    CODEX("codex", "Codex 6"),
+    GROK("grok", "Grok 4.5"),
+    OLLAMA_CLOUD("ollama_cloud", "Cloud Flash"),
+    OLLAMA("ollama", "Local"),
     CLAUDE("claude", "Claude"),
-    CODEX("codex", "Codex"),
 }
 
 enum class SessionUrgency(val wireName: String, val label: String, val rank: Int) {
@@ -207,12 +213,12 @@ data class CosBriefingPayload(
     val scannedCount: Int,
     val didFullTmuxScan: Boolean = false,
     val vaultNotesChecked: Int = 0,
+    val promptChars: Int = 0,
     val generatedAtMs: Long = System.currentTimeMillis(),
 ) {
     /**
      * Unified, deduplicated action plan for this turn:
-     * merges multiple SEND actions targeting the SAME tmux session into ONE consolidated prompt
-     * so Paul never has to tap 5 separate buttons when giving multi-step instructions.
+     * preserves distinct clickable choices/decisions per session while removing exact duplicates.
      */
     val actionPlan: List<CosAction> by lazy {
         val raw = buildList {
@@ -221,17 +227,17 @@ data class CosBriefingPayload(
         }
         if (raw.isEmpty()) return@lazy emptyList()
 
-        val sendGroups = LinkedHashMap<String, MutableList<CosAction>>()
+        val sends = mutableListOf<CosAction>()
+        val seenSends = mutableSetOf<String>()
         val lifecycle = mutableListOf<CosAction>()
         val seenLifecycle = mutableSetOf<String>()
 
         raw.forEach { act ->
             when (act.actionType) {
                 CosActionType.SEND -> {
-                    val key = act.session.trim().lowercase()
-                    val group = sendGroups.getOrPut(key) { mutableListOf() }
-                    if (group.none { it.sendText.trim().equals(act.sendText.trim(), ignoreCase = true) }) {
-                        group.add(act)
+                    val sig = "${act.session.trim().lowercase()}:${act.sendText.trim().lowercase()}"
+                    if (seenSends.add(sig)) {
+                        sends.add(act)
                     }
                 }
 
@@ -243,24 +249,7 @@ data class CosBriefingPayload(
                 }
             }
         }
-
-        val mergedSends = sendGroups.values.map { list ->
-            if (list.size == 1) {
-                list.first()
-            } else {
-                val first = list.first()
-                val combinedText = list.joinToString("\n") { it.sendText.trim() }
-                CosAction(
-                    id = first.id,
-                    actionType = CosActionType.SEND,
-                    label = "Send to ${first.session} (${list.size} steps)",
-                    session = first.session,
-                    sendText = combinedText,
-                    risky = list.any { it.risky || CosAction.looksRiskyText(it.sendText) },
-                )
-            }
-        }
-        mergedSends + lifecycle
+        sends + lifecycle
     }
 
     val decisionCount: Int
@@ -304,33 +293,29 @@ object ChiefOfStaffEngine {
     val DEFAULT_AGENTS_MD = """
         # Chief of Staff Orchestrator — AGENTS.md
 
-        You are Paul's executive Chief of Staff & strategic assistant. You help Paul think, prioritize, learn across projects, and act cleanly across his Obsidian vault on `delllap` and his live `tmux` sessions—like a real human chief of staff in a chat thread.
+        You are Paul's executive Chief of Staff & strategic assistant across his `tmux` sessions and canonical Obsidian vault (`delllap:/home/paul/ObsidianVault_Final`).
 
-        ## Big-Picture & Conversational Agent Style
-        - **Act like an intelligent chat agent**, not a rigid dashboard generator.
-        - Lead directly with Paul's question, strategic context, and vault knowledge. Active `tmux` sessions are ONE execution signal, not the whole world.
+        ## Stay Strictly on Focus (CRITICAL)
+        - **Only address what Paul is focused on right now.** Do NOT re-inspect unrelated `tmux` sessions, do NOT re-crawl the vault, and do NOT spawn subagents on routine or single-session turns.
+        - **Full analysis ONLY when asked:** Populate `sessions` across all sessions and propose broad next steps ONLY when `full_scan=true` or Paul explicitly asks for a full state/briefing/next-steps review.
         - Write `reply` in crisp, natural prose/bullets (never dump raw JSON inside `reply`).
-        - Only populate `sessions` when a full scan was requested (`full_scan: true`) OR when specific sessions were inspected/updated for Paul's question.
 
-        ## Direct Execution vs Proactive Suggestions (CRITICAL)
-        - **`execute_now` (NO extra approval prompt!)**: Whenever Paul explicitly tells you in chat to send a command/message to a `tmux` session, start a new `tmux` session, end an existing `tmux` session, or rename a `tmux` session, put it in `execute_now`—the runner will **immediately execute it right now** and report a receipt!
-          - **Rename**: use `action_type: "RENAME_TMUX"`, `session` = the current name, and `new_name` = the requested name. Do not send a shell `tmux rename-session` command.
-          - **Consolidate per session**: If Paul gives 2–4 instructions for the SAME `tmux` session, ALWAYS merge them into **ONE single `SEND`** in `execute_now` with a clean, numbered/structured prompt!
+        ## Direct Execution vs Clickable Decisions & Suggestions
+        - **`execute_now` (runs immediately, no approval prompt):** Put actions Paul explicitly ordered in chat here (`SEND`, `START_TMUX`, `KILL_TMUX`, `RENAME_TMUX`).
+          - **Rename:** `action_type: "RENAME_TMUX"`, `session` = current name, `new_name` = requested name.
+          - **Consolidate per session:** Merge multiple instructions for the SAME session into ONE `SEND`.
           - For `START_TMUX`, use verified YOLO flags when appropriate (`codex --dangerously-bypass-approvals-and-sandbox`, `agy --dangerously-skip-permissions`, `opencode --auto`, `claude --dangerously-skip-permissions`, `grok --always-approve`).
-        - **`orchestrator_actions` (ONLY for proactive suggestions!)**: Put items here ONLY when YOU are proactively suggesting something Paul did NOT explicitly ask to run yet. Never force Paul to re-approve something he just told you to do!
+        - **Clickable Decisions & Next-Step Replies (`sessions[].suggested_actions` / `orchestrator_actions`):**
+          - Whenever you inspect a specific session (or run a full scan), ALWAYS include that session in `sessions` with its `status`, `decision_needed` (if waiting on a choice), and **1–3 concrete clickable `suggested_actions`** (ready-to-send replies, approvals, or logical next commands for that session) so Paul can tap to respond without typing!
+          - Keep suggested actions scoped strictly to the session(s) Paul asked about.
 
-        ## Persistent Learning & Assistant Notebook (`MEMORY.md` / `AGENTS.md` / `notes/*.md`)
-        - You maintain durable assistant memory inside `~/.config/paullm-cos/`:
-          - `MEMORY.md`: ongoing project specifics, Paul's preferences, open decisions, key vault takeaways, commitments.
-          - `AGENTS.md`: operating instructions and workflow preferences Paul teaches you.
-          - `notes/<project>.md`: dedicated per-project briefs (e.g. `notes/open-roi.md`, `notes/pocket-gate.md`).
-        - Whenever Paul shares a preference, corrects your behavior, makes a key decision, or surfaces durable project facts from chat or `delllap` vault notes, emit concise `memory_updates` (`mode: "append"` or `"replace"`) so you get smarter every conversation!
+        ## Lean Tool & Subagent Use
+        - On routine focused turns, answer directly from the provided context in one turn (zero extra tool calls).
+        - Only when deeper vault research or multi-session analysis is actually requested (e.g. `full_scan=true` or Paul asks to dig into `delllap`), delegate noisy reads to a cheap `flash_lite` / `flash` subagent or one targeted read-only `ssh -o BatchMode=yes delllap ...` command so your main context stays thin.
+        - Never edit/delete vault notes unless asked. Cite used vault notes in `vault_refs` with Perlite URLs: `https://delllap.tailfaa66b.ts.net/wiki/?link=/<path-without-.md>`.
 
-        ## Canonical Vault Access (`delllap`) & Subagent Delegation
-        - Canonical personal Obsidian vault: `delllap:/home/paul/ObsidianVault_Final` (never stale local mirrors; never `ubuntu-server`'s `/home/paul/commure-athelas-vault`).
-        - Spin up read-only subagents (`invoke_subagent`) to search/read `delllap:/home/paul/ObsidianVault_Final` via `ssh -o BatchMode=yes delllap ...` in parallel whenever deeper project specs, history, or runbooks are needed.
-        - Never edit/delete vault notes unless Paul explicitly asks. Cite relied-upon notes in `vault_refs` with exact Perlite URLs:
-          `https://delllap.tailfaa66b.ts.net/wiki/?link=/<path-without-.md>`
+        ## Working Memory (`~/.config/paullm-cos/`)
+        - Emit concise `memory_updates` (`MEMORY.md`, `AGENTS.md`, or `notes/<project>.md`) only when Paul shares a durable preference, correction, or key decision.
     """.trimIndent()
 
     private val PYTHON_RUNNER = """
@@ -460,6 +445,53 @@ def extract_json(text):
         return json.loads(text[start:end + 1])
     raise ValueError("Could not parse JSON from model output: " + text[:240])
 
+def shorten_cmd(raw):
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    parts = raw.split()
+    head = os.path.basename(parts[0])
+    rest = " ".join(parts[1:])
+    out = f"{head} {rest}".strip() if rest else head
+    return out[:60]
+
+def shorten_path(path):
+    home = str(pathlib.Path.home())
+    if path == home:
+        return "~"
+    if path.startswith(home + "/"):
+        return "~/" + path[len(home) + 1:]
+    return path
+
+def session_mentioned(name, low_msg):
+    if not name or not low_msg:
+        return False
+    low_name = name.lower()
+    if len(low_name) >= 3 and low_name in low_msg:
+        return True
+    return bool(re.search(r'(?<![a-z0-9_-])' + re.escape(low_name) + r'(?![a-z0-9_-])', low_msg))
+
+def detect_intent(user_msg, explicit_full_scan=False):
+    low_q = (user_msg or "").lower()
+    full_triggers = (
+        "full scan", "full analysis", "scan all", "all tmux", "all sessions",
+        "brief me", "briefing", "tmux status", "what's running", "whats running",
+        "current state of", "state of tmux", "next steps across", "overview of all",
+    )
+    full_scan = bool(explicit_full_scan) or any(k in low_q for k in full_triggers)
+    vault_triggers = (
+        "vault", "obsidian", "delllap", "perlite", "priorit", "roadmap",
+        "research", "runbook", "what should i work on", "big picture",
+        "vault updates", "open decisions",
+    )
+    wants_vault = full_scan or any(k in low_q for k in vault_triggers)
+    deep_triggers = (
+        "deep dive", "full analysis", "compare", "cross-check", "strategy",
+        "next steps", "priorit", "research",
+    )
+    wants_deep = full_scan or wants_vault or any(k in low_q for k in deep_triggers)
+    return full_scan, wants_vault, wants_deep
+
 def capture_tmux(full_scan=False, user_msg=""):
     panes_out = run_cmd([
         "tmux", "list-panes", "-a", "-F",
@@ -470,7 +502,9 @@ def capture_tmux(full_scan=False, user_msg=""):
     for line in ps_out.splitlines():
         parts = line.strip().split(None, 1)
         if len(parts) == 2:
-            children.setdefault(parts[0], []).append(parts[1][:180])
+            short = shorten_cmd(parts[1])
+            if short:
+                children.setdefault(parts[0], []).append(short)
 
     low_msg = (user_msg or "").lower()
     snap = []
@@ -481,31 +515,37 @@ def capture_tmux(full_scan=False, user_msg=""):
             continue
         seen.add(p[0])
         name, pane_id, cmd, pid, cwd = p[0], p[1], p[2], p[3], p[4]
-        title = p[5] if len(p) > 5 else ""
+        title = (p[5] if len(p) > 5 else "").strip()
         attached = p[6] if len(p) > 6 else "0"
         windows = p[7] if len(p) > 7 else "1"
 
-        # Only capture full scrollback on explicit full_scan OR when this specific session is named in user_msg!
-        should_capture_pane = full_scan or (len(name) >= 2 and name.lower() in low_msg)
+        named = session_mentioned(name, low_msg)
+        should_capture_pane = full_scan or named
         tail = ""
         branch = ""
         if should_capture_pane:
-            raw = run_cmd(["tmux", "capture-pane", "-t", pane_id, "-p", "-J", "-S", "-80"])
+            max_lines = 25 if named else 20
+            max_chars = 1400 if named else 900
+            raw = run_cmd(["tmux", "capture-pane", "-t", pane_id, "-p", "-J", "-S", "-60"])
             clean_lines = [ANSI_RE.sub("", l).rstrip() for l in raw.splitlines()]
             clean_lines = [l for l in clean_lines if l.strip()]
-            tail = "\n".join(clean_lines[-50:])[-2400:]
+            tail = "\n".join(clean_lines[-max_lines:])[-max_chars:]
             if cwd and os.path.isdir(cwd):
                 branch = run_cmd(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], timeout=2).strip()
         entry = {
             "session": name,
-            "pane_id": pane_id,
             "cmd": cmd,
-            "child_cmds": children.get(pid, [])[:3],
-            "cwd": cwd,
-            "title": title,
-            "attached": attached,
-            "windows": windows,
+            "cwd": shorten_path(cwd),
         }
+        c_cmds = children.get(pid, [])[:2]
+        if c_cmds:
+            entry["child_cmds"] = c_cmds
+        if title and title != cmd and title != name:
+            entry["title"] = title[:60]
+        if attached == "1":
+            entry["attached"] = "1"
+        if windows != "1":
+            entry["windows"] = windows
         if branch:
             entry["git_branch"] = branch
         if tail:
@@ -610,22 +650,29 @@ def execute_requested_actions(raw_actions):
             receipts.append({"action_type": atype, "session": sess, "summary": lbl or atype, "ok": False, "error": str(e)[:180]})
     return receipts
 
-def load_cos_memory(cos_dir, user_msg, default_memory_md):
+def load_cos_memory(cos_dir, user_msg, default_memory_md, include_base=True):
     mem_path = cos_dir / "MEMORY.md"
     if not mem_path.exists() and default_memory_md:
         mem_path.write_text(default_memory_md, encoding="utf-8")
     notes_dir = cos_dir / "notes"
     notes_dir.mkdir(parents=True, exist_ok=True)
-    memory_txt = mem_path.read_text(encoding="utf-8", errors="ignore")[:5000] if mem_path.exists() else ""
+    memory_txt = mem_path.read_text(encoding="utf-8", errors="ignore")[:2500] if (include_base and mem_path.exists()) else ""
     note_files = sorted(notes_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
-    note_index = [p.name for p in note_files[:20]]
+    note_index = [p.name for p in note_files[:15]] if include_base else []
     low_msg = (user_msg or "").lower()
     matched_notes = {}
-    for nf in note_files[:12]:
+    for nf in note_files[:15]:
         stem = nf.stem.lower()
-        if stem in low_msg or len(matched_notes) < 2:
-            matched_notes[f"notes/{nf.name}"] = nf.read_text(encoding="utf-8", errors="ignore")[:1200]
-    return {"memory_md": memory_txt, "note_files": note_index, "note_excerpts": matched_notes}
+        if len(stem) >= 3 and stem in low_msg and len(matched_notes) < 2:
+            matched_notes[f"notes/{nf.name}"] = nf.read_text(encoding="utf-8", errors="ignore")[:900]
+    out = {}
+    if memory_txt:
+        out["memory_md"] = memory_txt
+    if note_index:
+        out["note_files"] = note_index
+    if matched_notes:
+        out["note_excerpts"] = matched_notes
+    return out
 
 def apply_memory_updates(cos_dir, updates):
     if not isinstance(updates, list) or not updates:
@@ -660,18 +707,20 @@ def apply_memory_updates(cos_dir, updates):
             pass
     return learned
 
-def capture_vault_context(snap, user_msg):
-    # Fast read-only context pull from canonical vault on delllap:/home/paul/ObsidianVault_Final
+def capture_vault_context(user_msg, full_scan=False, wants_vault=False):
+    # Only query canonical vault on delllap when explicitly relevant or on full_scan
+    if not wants_vault:
+        return {"available": False, "skipped": True, "recent": [], "excerpts": []}
     vault_root = "/home/paul/ObsidianVault_Final"
     perlite_base = "https://delllap.tailfaa66b.ts.net/wiki/?link=/"
     terms = set()
-    stop = {"the", "and", "for", "with", "that", "this", "from", "what", "which", "are", "all", "tmux", "session", "sessions", "brief", "briefing", "status", "right", "now", "about", "into", "your", "have", "vault", "delllap", "check", "give", "chief", "staff"}
-    raw_sources = [user_msg] + [s.get("session", "") + " " + s.get("title", "") + " " + os.path.basename(s.get("cwd", "")) for s in snap]
-    for src in raw_sources:
-        for tok in re.findall(r"[A-Za-z0-9]{3,}", src.lower()):
-            if tok not in stop:
-                terms.add(tok)
-    terms_b64 = base64.b64encode(json.dumps(sorted(terms)[:24]).encode()).decode()
+    stop = {"the", "and", "for", "with", "that", "this", "from", "what", "which", "are", "all", "tmux", "session", "sessions", "brief", "briefing", "status", "right", "now", "about", "into", "your", "have", "vault", "delllap", "check", "give", "chief", "staff", "next", "steps", "current", "state", "full", "scan", "analysis"}
+    for tok in re.findall(r"[A-Za-z0-9]{3,}", (user_msg or "").lower()):
+        if tok not in stop:
+            terms.add(tok)
+    low_q = (user_msg or "").lower()
+    include_recent_fallback = full_scan or any(k in low_q for k in ("priorit", "recent", "update", "overview", "big picture", "what should i work on"))
+    terms_b64 = base64.b64encode(json.dumps(sorted(terms)[:16]).encode()).decode()
 
     remote_py = f'''
 import base64, json, os, pathlib, re
@@ -680,6 +729,7 @@ if not root.is_dir():
     print(json.dumps({{"available": False, "recent": [], "excerpts": []}}))
     raise SystemExit(0)
 terms = json.loads(base64.b64decode({terms_b64!r}).decode())
+include_recent = {include_recent_fallback!r}
 files = []
 for sub in ["INBOX/Agent-Updates", "PROJECTS", "."]:
     base = root / sub if sub != "." else root
@@ -710,18 +760,18 @@ for mt, rel, fp in files:
         seen.add(rel)
         dedup.append((mt, rel, fp))
 
-recent = [{{"path": rel, "perlite_url": {perlite_base!r} + rel[:-3]}} for _, rel, _ in dedup[:14]]
+recent = [{{"path": rel, "perlite_url": {perlite_base!r} + rel[:-3]}} for _, rel, _ in dedup[:6]] if include_recent else []
 
 scored = []
-for idx, (mt, rel, fp) in enumerate(dedup[:160]):
+for idx, (mt, rel, fp) in enumerate(dedup[:120]):
     low = rel.lower()
     hits = sum(2 for t in terms if t in low)
-    if hits > 0 or idx < 4:
+    if hits > 0 or (include_recent and idx < 2):
         scored.append((hits, -idx, rel, fp))
 scored.sort(reverse=True)
 
 excerpts = []
-for _, _, rel, fp in scored[:6]:
+for _, _, rel, fp in scored[:3]:
     try:
         txt = fp.read_text(encoding="utf-8", errors="ignore")
         if txt.startswith("---"):
@@ -730,9 +780,9 @@ for _, _, rel, fp in scored[:6]:
                 txt = txt[end_fm + 4:]
         lines = [l.rstrip() for l in txt.strip().splitlines() if l.strip()]
         title = next((l.lstrip("# ").strip() for l in lines[:4] if l.startswith("#")), pathlib.Path(rel).stem)
-        excerpt = "\\n".join(lines[:22])[:850]
+        excerpt = "\\n".join(lines[:14])[:500]
         excerpts.append({{
-            "title": title[:90],
+            "title": title[:80],
             "path": rel,
             "perlite_url": {perlite_base!r} + rel[:-3],
             "excerpt": excerpt,
@@ -860,14 +910,88 @@ def try_ollama(system_prompt, user_prompt):
             last_err = f"{model}: {e}"
     raise RuntimeError(last_err)
 
-def try_cli(bin_name, args_fn, prompt, cos_dir, timeout_s=65):
+def try_cli(bin_name, args_fn, prompt, cos_dir, timeout_s=65, model_label=None):
     path = shutil.which(bin_name)
+    if not path:
+        for extra in (pathlib.Path.home() / ".local/bin" / bin_name, pathlib.Path.home() / ".grok/bin" / bin_name):
+            if extra.exists() and os.access(extra, os.X_OK):
+                path = str(extra)
+                break
     if not path:
         raise RuntimeError(f"{bin_name} not found")
     proc = subprocess.run(args_fn(path, prompt), cwd=str(cos_dir), capture_output=True, text=True, timeout=timeout_s)
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or f"{bin_name} exit {proc.returncode}").strip()[:280])
-    return extract_json(proc.stdout), bin_name, bin_name, None
+    return extract_json(proc.stdout), bin_name, (model_label or bin_name), None
+
+def try_ollama_cloud(system_prompt, user_prompt, cos_dir):
+    # Fast direct Ollama Cloud API via keydeck (1-3s vs ~45s opencode cold start), with opencode fallback
+    keydeck_bin = shutil.which("keydeck") or str(pathlib.Path.home() / ".local/bin/keydeck")
+    flash_models = ["minimax-m3.1-flash", "glm-5.3-flash", "deepseek-v4.1-flash"]
+    last_err = "Ollama Cloud unavailable"
+    if os.path.exists(keydeck_bin) and os.access(keydeck_bin, os.X_OK):
+        helper_py = (
+            "import json, os, sys, urllib.request\n"
+            "req_data = json.loads(sys.stdin.read())\n"
+            "key = os.environ.get('OLLAMA_API_KEY', '')\n"
+            "if not key: raise SystemExit('OLLAMA_API_KEY missing')\n"
+            "req = urllib.request.Request('https://ollama.com/api/chat', data=json.dumps(req_data).encode(), "
+            "headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key})\n"
+            "with urllib.request.urlopen(req, timeout=35) as r:\n"
+            "    print(r.read().decode())\n"
+        )
+        for model in flash_models:
+            try:
+                body = {
+                    "model": model,
+                    "stream": False,
+                    "format": "json",
+                    "options": {"temperature": 0.2},
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                }
+                proc = subprocess.run(
+                    [keydeck_bin, "use", "ollama-cloud", "--", "python3", "-c", helper_py],
+                    input=json.dumps(body),
+                    cwd=str(cos_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    resp = json.loads(proc.stdout.strip().splitlines()[-1])
+                    content = resp.get("message", {}).get("content", "")
+                    parsed = extract_json(content)
+                    return parsed, "ollama-cloud", model, None
+                last_err = f"{model}: {(proc.stderr or proc.stdout).strip()[:180]}"
+            except Exception as e:
+                last_err = f"{model}: {e}"
+    # Fallback to opencode run with Ollama Cloud flash model
+    oc_bin = shutil.which("opencode") or str(pathlib.Path.home() / ".local/bin/opencode")
+    if os.path.exists(oc_bin) and os.access(oc_bin, os.X_OK):
+        cmd_prefix = [keydeck_bin, "use", "ollama-cloud", "--"] if (os.path.exists(keydeck_bin) and os.access(keydeck_bin, os.X_OK)) else []
+        proc = subprocess.run(
+            cmd_prefix + [oc_bin, "run", "--pure", "-m", "ollama-cloud/minimax-m3.1-flash", system_prompt + "\n\n" + user_prompt],
+            cwd=str(cos_dir),
+            capture_output=True,
+            text=True,
+            timeout=75,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return extract_json(proc.stdout), "opencode", "minimax-m3.1-flash", None
+        last_err = f"opencode: {(proc.stderr or proc.stdout).strip()[:180]}"
+    raise RuntimeError(last_err)
+
+COMPACT_SCHEMA_HINT = (
+    '{"headline":"short title","reply":"concise natural prose",'
+    '"sessions":[{"session":"name","status":"NEEDS_DECISION|BLOCKED|WAITING_INPUT|RUNNING|DONE|IDLE","summary":"...","decision_needed":"...","suggested_actions":[]}],'
+    '"execute_now":[{"action_type":"SEND|START_TMUX|KILL_TMUX|RENAME_TMUX","session":"name","send":"...","command":"...","cwd":"...","new_name":"...","label":"..."}],'
+    '"orchestrator_actions":[{"action_type":"SEND|START_TMUX|KILL_TMUX|RENAME_TMUX","label":"...","session":"name","send":"...","command":"...","cwd":"...","new_name":"...","risky":false}],'
+    '"memory_updates":[{"file":"MEMORY.md","mode":"append|replace","summary":"...","content":"..."}],'
+    '"vault_refs":[{"title":"...","path":"...","perlite_url":"https://delllap.tailfaa66b.ts.net/wiki/?link=/...","relevance":"..."}]}'
+)
 
 def main():
     payload = json.loads(base64.b64decode(sys.argv[1]).decode("utf-8"))
@@ -877,85 +1001,143 @@ def main():
     history = payload.get("history") or []
     default_agents = payload.get("default_agents_md", "")
     default_memory = payload.get("default_memory_md", "")
-    full_scan = bool(payload.get("full_scan", False))
-    if not full_scan:
-        low_q = user_msg.lower()
-        if any(k in low_q for k in ("full scan", "scan all", "all tmux", "all sessions", "brief me", "briefing", "tmux status", "what's running", "whats running")):
-            full_scan = True
+    full_scan, wants_vault, wants_deep = detect_intent(user_msg, bool(payload.get("full_scan", False)))
 
     cos_dir = pathlib.Path.home() / ".config/paullm-cos"
     cos_dir.mkdir(parents=True, exist_ok=True)
     agents_path = cos_dir / "AGENTS.md"
     if not agents_path.exists() and default_agents:
         agents_path.write_text(default_agents, encoding="utf-8")
-    agents_md = agents_path.read_text(encoding="utf-8")[:6000] if agents_path.exists() else default_agents
-    mem_ctx = load_cos_memory(cos_dir, user_msg, default_memory)
+    agents_md = agents_path.read_text(encoding="utf-8")[:3500] if agents_path.exists() else default_agents[:3500]
     schema_path = cos_dir / "briefing-schema.json"
     schema_path.write_text(json.dumps(SCHEMA, indent=2), encoding="utf-8")
 
     snap = capture_tmux(full_scan=full_scan, user_msg=user_msg)
-    vault_ctx = capture_vault_context(snap, user_msg)
-    schema_hint = json.dumps(SCHEMA)
+    vault_ctx = capture_vault_context(user_msg, full_scan=full_scan, wants_vault=wants_vault)
+    has_vault_data = bool(vault_ctx.get("excerpts") or vault_ctx.get("recent"))
+
+    contract_rules = (
+        f"MODE: full_scan={str(full_scan).lower()}.\n"
+        "- Stay strictly on Paul's current focus; do NOT re-inspect unrelated sessions or vault notes.\n"
+        "- Put explicit user commands in `execute_now` (merge multiple sends per session into ONE SEND; renames use RENAME_TMUX + new_name).\n"
+        "- Whenever inspecting a specific session (or full_scan=true), ALWAYS include that session in `sessions` with `status`, `decision_needed` (if any), and 1-3 concrete clickable `suggested_actions` (ready-to-send replies or next-step commands) so Paul can tap to respond!\n"
+        "- Put additional proactive suggestions (not explicitly ordered) in `orchestrator_actions`.\n"
+        "- Emit `memory_updates` only for durable preferences/decisions; cite used vault notes in `vault_refs`."
+    )
+
+    tmux_label = "TMUX FULL SNAPSHOT" if full_scan else "TMUX INDEX (pane tails included ONLY if named)"
+    tmux_json = json.dumps(snap, separators=(",", ":"))
+
+    # 1) Lean prompt for agy (no verbose JSON schema; delta-only when continuing --conversation)
+    if conv_id:
+        delta_mem = load_cos_memory(cos_dir, user_msg, default_memory, include_base=False)
+        agy_parts = [
+            f"FOLLOW-UP TURN (full_scan={str(full_scan).lower()}). Stay strictly on Paul's current focus; do not re-analyze unrelated sessions. If inspecting a session, include it in `sessions` with 1-3 clickable `suggested_actions` for likely replies/next steps.",
+            "USER REQUEST:\n" + user_msg,
+            f"{tmux_label}:\n{tmux_json}",
+        ]
+        if delta_mem:
+            agy_parts.append("MATCHED NOTES:\n" + json.dumps(delta_mem, separators=(",", ":")))
+        if has_vault_data:
+            agy_parts.append("VAULT CONTEXT (delllap):\n" + json.dumps(vault_ctx, separators=(",", ":")))
+        agy_prompt = "\n\n".join(agy_parts)
+    else:
+        mem_ctx = load_cos_memory(cos_dir, user_msg, default_memory, include_base=True)
+        agy_parts = [
+            agents_md.strip(),
+            contract_rules,
+        ]
+        if mem_ctx:
+            agy_parts.append("MEMORY:\n" + json.dumps(mem_ctx, separators=(",", ":")))
+        agy_parts.append("USER REQUEST:\n" + user_msg)
+        agy_parts.append(f"{tmux_label}:\n{tmux_json}")
+        if has_vault_data:
+            agy_parts.append("VAULT CONTEXT (delllap):\n" + json.dumps(vault_ctx, separators=(",", ":")))
+        agy_prompt = "\n\n".join(agy_parts)
+
+    # 2) Stateless prompt for ollama / pi / claude / codex (compact schema + short history)
+    stateless_mem = load_cos_memory(cos_dir, user_msg, default_memory, include_base=True)
     system_prompt = (
         agents_md.strip() + "\n\n"
-        "OUTPUT CONTRACT: Return ONLY a valid JSON object matching this schema:\n"
-        + schema_hint + "\n"
-        f"SCAN MODE: full_scan={str(full_scan).lower()}.\n"
-        "- Put actions Paul EXPLICITLY requested in chat into `execute_now` (they run IMMEDIATELY without nagging for approval; merge multiple commands for the same session into ONE SEND!). Rename requests use RENAME_TMUX with session + new_name.\n"
-        "- Put YOUR OWN proactive suggestions (things Paul did not explicitly command) into `orchestrator_actions`.\n"
-        "- Only include `sessions` entries when full_scan=true or for specific sessions relevant to Paul's question.\n"
-        "- Emit `memory_updates` whenever Paul shares preferences, corrections, decisions, or durable project facts.\n"
-        "- Cite vault notes used in `vault_refs` with Perlite URLs (`https://delllap.tailfaa66b.ts.net/wiki/?link=/<path-without-.md>`).\n"
-        "- Keep `reply` natural, conversational, and concise (never raw JSON)."
+        "OUTPUT CONTRACT: Return ONLY valid JSON matching:\n"
+        + COMPACT_SCHEMA_HINT + "\n"
+        + contract_rules
     )
-
     hist_block = ""
     if history:
-        lines = [f"- {h.get('role','user').upper()}: {str(h.get('text',''))[:400]}" for h in history[-6:]]
-        hist_block = "RECENT CHAT HISTORY:\n" + "\n".join(lines) + "\n\n"
-
-    tmux_label = "FULL LIVE TMUX SNAPSHOT" if full_scan else "TMUX SESSION DIRECTORY (pane output omitted unless session was named)"
-    user_prompt = (
-        hist_block
-        + "ASSISTANT WORKING MEMORY (~/.config/paullm-cos/MEMORY.md & notes/):\n" + json.dumps(mem_ctx) + "\n\n"
-        + "USER REQUEST:\n" + user_msg + "\n\n"
-        + f"{tmux_label}:\n" + json.dumps(snap) + "\n\n"
-        + "CANONICAL VAULT CONTEXT (delllap:/home/paul/ObsidianVault_Final — spin up read-only subagents via `ssh -o BatchMode=yes delllap ...` if deeper vault info is needed):\n"
-        + json.dumps(vault_ctx)
-    )
+        lines = [f"- {h.get('role','user').upper()}: {str(h.get('text',''))[:280]}" for h in history[-4:]]
+        hist_block = "RECENT HISTORY:\n" + "\n".join(lines) + "\n\n"
+    stateless_parts = [hist_block + "USER REQUEST:\n" + user_msg, f"{tmux_label}:\n{tmux_json}"]
+    if stateless_mem:
+        stateless_parts.insert(0, "MEMORY:\n" + json.dumps(stateless_mem, separators=(",", ":")))
+    if has_vault_data:
+        stateless_parts.append("VAULT CONTEXT (delllap):\n" + json.dumps(vault_ctx, separators=(",", ":")))
+    user_prompt = "\n\n".join(stateless_parts)
     combined_prompt = system_prompt + "\n\n" + user_prompt
 
     errors = []
     result = None
+    used_prompt_chars = len(agy_prompt)
 
+    auto_order = (
+        ["agy_orch_neon", "agy_flash", "codex", "grok", "ollama_cloud", "ollama"]
+        if (full_scan or wants_deep)
+        else ["agy_flash", "codex", "grok", "ollama_cloud", "ollama"]
+    )
     order = {
-        "auto": ["agy_flash", "ollama", "pi", "claude", "codex"],
+        "auto": auto_order,
         "agy_flash": ["agy_flash"],
         "agy_orch": ["agy_orch_neon", "agy_orch_argon", "agy_neon_low"],
-        "ollama": ["ollama"],
-        "pi": ["pi"],
-        "claude": ["claude"],
         "codex": ["codex"],
-    }.get(backend, ["agy_flash", "ollama", "pi", "claude", "codex"])
+        "grok": ["grok"],
+        "ollama_cloud": ["ollama_cloud"],
+        "ollama": ["ollama"],
+        "claude": ["claude"],
+    }.get(backend, auto_order)
 
     for step in order:
         try:
             if step == "agy_flash":
-                result = try_agy("gemini-3.8-flash-low", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=80)
+                used_prompt_chars = len(agy_prompt)
+                result = try_agy("gemini-3.8-flash-low", agy_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=80)
             elif step == "agy_orch_neon":
-                result = try_agy("gemini-pro-orchestrator-neon", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=145)
+                used_prompt_chars = len(agy_prompt)
+                result = try_agy("gemini-pro-orchestrator-neon", agy_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=145)
             elif step == "agy_orch_argon":
-                result = try_agy("gemini-pro-orchestrator-g1-pro", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=145)
+                used_prompt_chars = len(agy_prompt)
+                result = try_agy("gemini-pro-orchestrator-g1-pro", agy_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=145)
             elif step == "agy_neon_low":
-                result = try_agy("gemini-4-neon-low", combined_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=85)
-            elif step == "ollama":
-                result = try_ollama(system_prompt, user_prompt)
-            elif step == "pi":
-                result = try_cli("pi", lambda p, pr: [p, "-p", "--no-session", pr], combined_prompt, cos_dir)
-            elif step == "claude":
-                result = try_cli("claude", lambda p, pr: [p, "-p", pr], combined_prompt, cos_dir)
+                used_prompt_chars = len(agy_prompt)
+                result = try_agy("gemini-4-neon-low", agy_prompt, schema_path, cos_dir, conv_id, allow_tools=True, timeout_s=85)
             elif step == "codex":
-                result = try_cli("codex", lambda p, pr: [p, "exec", "--skip-git-repo-check", pr], combined_prompt, cos_dir)
+                used_prompt_chars = len(combined_prompt)
+                result = try_cli(
+                    "codex",
+                    lambda p, pr: [p, "exec", "--skip-git-repo-check", "-m", "gpt-6-luna", "-c", 'model_reasoning_effort="low"', pr],
+                    combined_prompt,
+                    cos_dir,
+                    timeout_s=75,
+                    model_label="gpt-6-luna",
+                )
+            elif step == "grok":
+                used_prompt_chars = len(combined_prompt)
+                result = try_cli(
+                    "grok",
+                    lambda p, pr: [p, "--model", "grok-4.5", "--disable-web-search", "-p", pr],
+                    combined_prompt,
+                    cos_dir,
+                    timeout_s=75,
+                    model_label="grok-4.5",
+                )
+            elif step == "ollama_cloud":
+                used_prompt_chars = len(combined_prompt)
+                result = try_ollama_cloud(system_prompt, user_prompt, cos_dir)
+            elif step == "ollama":
+                used_prompt_chars = len(combined_prompt)
+                result = try_ollama(system_prompt, user_prompt)
+            elif step == "claude":
+                used_prompt_chars = len(combined_prompt)
+                result = try_cli("claude", lambda p, pr: [p, "-p", pr], combined_prompt, cos_dir, model_label="claude")
             if result is not None:
                 break
         except Exception as e:
@@ -977,9 +1159,17 @@ def main():
         "scanned_count": len(snap),
         "did_full_scan": full_scan,
         "vault_notes_checked": len(vault_ctx.get("excerpts") or []),
+        "prompt_chars": used_prompt_chars,
         "executed_receipts": executed_receipts,
         "learned_notes": learned_notes,
-        "snapshot_meta": {s["session"]: {"cmd": s["cmd"], "child_cmds": s["child_cmds"], "title": s["title"]} for s in snap},
+        "snapshot_meta": {
+            s["session"]: {
+                "cmd": s.get("cmd", ""),
+                "child_cmds": s.get("child_cmds", []),
+                "title": s.get("title", ""),
+            }
+            for s in snap
+        },
         "data": parsed,
     }))
 
@@ -1105,7 +1295,7 @@ if __name__ == "__main__":
             python3 "${'$'}HOME/.config/paullm-cos/cos_runner.py" '$reqB64'
         """.trimIndent()
 
-        val timeoutMs = if (backend == CosBackend.AGY_ORCH) 165_000L else 105_000L
+        val timeoutMs = if (backend == CosBackend.AGY_ORCH || (backend == CosBackend.AUTO && fullScan)) 165_000L else 105_000L
         val res = bridge.execCommand(PaullmShell.wrapLoginShell(script), timeoutMs = timeoutMs)
         if (res.error != null) {
             return Result.failure(IllegalStateException(res.error))
@@ -1294,6 +1484,7 @@ if __name__ == "__main__":
                 scannedCount = env.optInt("scanned_count", parsedSessions.size),
                 didFullTmuxScan = env.optBoolean("did_full_scan", fullScan),
                 vaultNotesChecked = env.optInt("vault_notes_checked", parsedVaultRefs.size),
+                promptChars = env.optInt("prompt_chars", 0),
             )
         }
     }
@@ -1315,6 +1506,67 @@ private fun urgencyColor(urgency: SessionUrgency): Color = when (urgency) {
     SessionUrgency.RUNNING -> CosCyan
     SessionUrgency.DONE -> CosGreen
     SessionUrgency.IDLE -> CosMuted
+}
+
+private val CosInlineMdRegex = Regex("""\*\*(.+?)\*\*|`([^`]+)`|\*([^*]+)\*""")
+private val CosHeadingRegex = Regex("""^#{1,6}\s+(.+)$""")
+private val CosBulletRegex = Regex("""^(\s*)[-*]\s+(.+)$""")
+
+private fun renderCosMarkdown(raw: String): AnnotatedString = buildAnnotatedString {
+    val lines = raw.replace("\r\n", "\n").split("\n")
+    lines.forEachIndexed { idx, line ->
+        if (idx > 0) append('\n')
+        val heading = CosHeadingRegex.matchEntire(line.trim())
+        if (heading != null) {
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold, color = Color.White)) {
+                appendInlineMarkdown(heading.groupValues[1])
+            }
+            return@forEachIndexed
+        }
+        val bullet = CosBulletRegex.matchEntire(line)
+        if (bullet != null) {
+            append(bullet.groupValues[1])
+            withStyle(SpanStyle(color = CosCyan, fontWeight = FontWeight.Bold)) {
+                append("• ")
+            }
+            appendInlineMarkdown(bullet.groupValues[2])
+            return@forEachIndexed
+        }
+        appendInlineMarkdown(line)
+    }
+}
+
+private fun AnnotatedString.Builder.appendInlineMarkdown(text: String) {
+    var cursor = 0
+    for (m in CosInlineMdRegex.findAll(text)) {
+        if (m.range.first > cursor) {
+            append(text.substring(cursor, m.range.first))
+        }
+        val bold = m.groups[1]?.value
+        val code = m.groups[2]?.value
+        val italic = m.groups[3]?.value
+        when {
+            bold != null -> withStyle(SpanStyle(fontWeight = FontWeight.Bold, color = Color.White)) {
+                append(bold)
+            }
+            code != null -> withStyle(
+                SpanStyle(
+                    fontFamily = FontFamily.Monospace,
+                    color = CosCyan,
+                    background = Color(0xFF0F172A),
+                ),
+            ) {
+                append(" $code ")
+            }
+            italic != null -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
+                append(italic)
+            }
+        }
+        cursor = m.range.last + 1
+    }
+    if (cursor < text.length) {
+        append(text.substring(cursor))
+    }
 }
 
 @Composable
@@ -2213,7 +2465,7 @@ fun ChiefOfStaffChatView(
                                 color = Color.White,
                             )
                             Text(
-                                text = "Runs on-demand directly on ${bridge.host.nickname}, inspects all live tmux panes + your Obsidian vault on delllap (with subagent research), uses ~/.config/paullm-cos/AGENTS.md, and can send replies or start/end tmux sessions with your permission.",
+                                text = "Stays lean and focused on your current request on ${bridge.host.nickname}. Only runs a full tmux + delllap vault analysis (via AGY Orchestrator) when you tap Full Scan or explicitly ask.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = CosMuted,
                             )
@@ -2473,6 +2725,14 @@ private fun CosAssistantMessageBubble(
                             if (briefing.vaultNotesChecked > 0) {
                                 append("${briefing.vaultNotesChecked} vault · ")
                             }
+                            if (briefing.promptChars > 0) {
+                                val approxTok = (briefing.promptChars + 3) / 4
+                                if (approxTok >= 1000) {
+                                    append(String.format(Locale.US, "~%.1fk tok · ", approxTok / 1000.0))
+                                } else {
+                                    append("~${approxTok}t · ")
+                                }
+                            }
                             append(timeLabel)
                         },
                         style = MaterialTheme.typography.labelSmall,
@@ -2481,8 +2741,9 @@ private fun CosAssistantMessageBubble(
                 }
 
                 val bodyText = briefing.reply.ifBlank { briefing.headline }
+                val renderedBody = remember(bodyText) { renderCosMarkdown(bodyText) }
                 Text(
-                    text = bodyText,
+                    text = renderedBody,
                     style = MaterialTheme.typography.bodyMedium,
                     color = Color(0xFFE2E8F0),
                 )

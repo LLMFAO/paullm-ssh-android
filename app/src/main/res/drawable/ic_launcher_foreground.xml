@@ -4,29 +4,19 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Outer subtle terminal frame -->
+    <!-- Clean white terminal prompt '>' -->
     <path
         android:fillColor="#00000000"
-        android:strokeColor="#38BDF8"
-        android:strokeWidth="3.5"
-        android:pathData="M28,30 L80,30 A6,6 0 0,1 86,36 L86,72 A6,6 0 0,1 80,78 L28,78 A6,6 0 0,1 22,72 L22,36 A6,6 0 0,1 28,30 Z" />
-    <!-- Top traffic accent dot (emerald active indicator) -->
-    <path
-        android:fillColor="#34D399"
-        android:pathData="M34,38 m-3,0 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0" />
-    <!-- Terminal prompt > -->
-    <path
-        android:fillColor="#00000000"
-        android:strokeColor="#38BDF8"
-        android:strokeWidth="5.5"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="6.5"
         android:strokeLineCap="round"
         android:strokeLineJoin="round"
-        android:pathData="M34,49 L47,58 L34,67" />
-    <!-- Cursor bar _ -->
+        android:pathData="M34,42 L48,54 L34,66" />
+    <!-- Clean white cursor bar '_' -->
     <path
         android:fillColor="#00000000"
-        android:strokeColor="#A78BFA"
-        android:strokeWidth="5.5"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="6.5"
         android:strokeLineCap="round"
-        android:pathData="M53,67 L72,67" />
+        android:pathData="M54,66 L74,66" />
 </vector>

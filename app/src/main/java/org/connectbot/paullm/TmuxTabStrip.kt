@@ -48,9 +48,12 @@ fun TmuxSessionTabStrip(
 ) {
     val vendorBySessionName = remoteTmuxSessions.associate { it.name to it.detectedVendor }
 
-    val openTmuxForActiveHost = bridges
-        .filter { it.host.id == activeHostId }
-        .mapNotNull { it.tmuxSessionName }
+    val hostBridges = bridges.mapIndexedNotNull { index, bridge ->
+        if (activeHostId == null || bridge.host.id == activeHostId) index to bridge else null
+    }
+
+    val openTmuxForActiveHost = hostBridges
+        .mapNotNull { (_, bridge) -> bridge.tmuxSessionName }
         .toSet()
 
     val unattachedRemote = remoteTmuxSessions.filter { it.name !in openTmuxForActiveHost }
@@ -68,7 +71,7 @@ fun TmuxSessionTabStrip(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            bridges.forEachIndexed { index, bridge ->
+            hostBridges.forEach { (index, bridge) ->
                 val isSelected = index == currentIndex
                 val sessionName = bridge.tmuxSessionName
                 val isTmux = sessionName != null
@@ -83,6 +86,7 @@ fun TmuxSessionTabStrip(
                     bridge.isConnecting -> Color(0xFFFBBF24)
                     else -> MaterialTheme.colorScheme.tertiary
                 }
+                val canCloseTab = isSelected && (hostBridges.size > 1 || isTmux)
 
                 Surface(
                     onClick = { onSelectTab(index) },
@@ -94,7 +98,7 @@ fun TmuxSessionTabStrip(
                     ),
                 ) {
                     Row(
-                        modifier = Modifier.padding(start = 8.dp, end = if (isSelected && (bridges.size > 1 || isTmux)) 2.dp else 8.dp, top = 5.dp, bottom = 5.dp),
+                        modifier = Modifier.padding(start = 8.dp, end = if (canCloseTab) 2.dp else 8.dp, top = 5.dp, bottom = 5.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Box(
@@ -115,7 +119,7 @@ fun TmuxSessionTabStrip(
                             overflow = TextOverflow.Ellipsis,
                             color = if (isSelected) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        if (isSelected && (bridges.size > 1 || isTmux)) {
+                        if (canCloseTab) {
                             IconButton(
                                 onClick = { onDetachTab(bridge) },
                                 modifier = Modifier.size(22.dp),
